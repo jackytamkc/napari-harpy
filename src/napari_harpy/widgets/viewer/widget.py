@@ -3,7 +3,9 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Literal
 
+import numpy as np
 import pandas as pd
+from loguru import logger
 from pandas.api.types import is_bool_dtype, is_numeric_dtype, is_object_dtype, is_string_dtype
 from qtpy.QtCore import QSignalBlocker, Qt
 from qtpy.QtGui import QPixmap
@@ -29,6 +31,7 @@ from napari_harpy._app_state import (
     get_or_create_app_state,
 )
 from napari_harpy._resources import get_logo_path
+from napari_harpy.core._color_source import TableColorSourceSpec
 from napari_harpy.core.spatialdata import (
     get_annotating_table_names,
     get_coordinate_system_names_from_sdata,
@@ -40,6 +43,7 @@ from napari_harpy.core.spatialdata import (
     get_spatialdata_shapes_options_for_coordinate_system_from_sdata,
     get_table_color_source_options,
 )
+from napari_harpy.viewer.category_colors import is_editable_category_column
 from napari_harpy.viewer.points_styling import PointsLoadResult
 from napari_harpy.widgets.shared_styles import (
     ACTION_BUTTON_STYLESHEET,
@@ -53,6 +57,7 @@ from napari_harpy.widgets.shared_styles import (
     format_feedback_identifier,
     set_status_card,
 )
+from napari_harpy.widgets.viewer.category_color_editor import CategoryColorEditor
 from napari_harpy.widgets.viewer.disclosure import _CollapsibleSectionWidget, _DisclosureElementWidget
 from napari_harpy.widgets.viewer.image_widget import ImageLoadRequest, _ImageCardWidget
 from napari_harpy.widgets.viewer.labels_widget import LabelsLoadRequest, _LabelsCardWidget
@@ -82,6 +87,63 @@ if TYPE_CHECKING:
 _SUMMARY_COORDINATE_SYSTEM_MAX_LENGTH = 32
 
 
+def _table_expression_layers(sdata: SpatialData, table_names: list[str]) -> dict[str, list[str]]:
+    """Return per-table expression-layer choices for var coloring (``X`` plus any ``table.layers``)."""
+    layers_by_table: dict[str, list[str]] = {}
+    for table_name in table_names:
+        try:
+            table_layers = list(getattr(sdata.tables[table_name], "layers", []) or [])
+        except (KeyError, TypeError, AttributeError):
+            logger.debug("Could not enumerate expression layers for table {!r}; offering X only.", table_name)
+            table_layers = []
+        # "X" is the alias for table.X; avoid showing it twice if a real layer is also named "X".
+        layers_by_table[table_name] = ["X", *(layer for layer in table_layers if layer != "X")]
+    return layers_by_table
+
+
+def _table_smoothers(sdata: SpatialData, table_names: list[str]) -> dict[str, list[str]]:
+    """Return per-table cell-graph smoother operators in ``obsp``.
+
+    A smoother is an ``obsp`` entry whose key starts with ``smoother`` and whose matrix is square
+    over the table's cells (``n_obs`` x ``n_obs``) — e.g. ``smoother_k100``. Keys are sorted so the
+    selected smoother is deterministic rather than dependent on ``obsp`` insertion order.
+    """
+    smoothers_by_table: dict[str, list[str]] = {}
+    for table_name in table_names:
+        try:
+            table = sdata.tables[table_name]
+            n_obs = table.n_obs
+            keys = sorted(
+                key
+                for key, operator in getattr(table, "obsp", {}).items()
+                if str(key).startswith("smoother") and getattr(operator, "shape", None) == (n_obs, n_obs)
+            )
+        except (KeyError, TypeError, AttributeError):
+            logger.debug("Could not enumerate obsp smoothers for table {!r}.", table_name)
+            keys = []
+        smoothers_by_table[table_name] = keys
+    return smoothers_by_table
+
+
+def _table_umap_available(sdata: SpatialData, table_names: list[str]) -> dict[str, bool]:
+    """Discover UMAP coordinates without building neighbours while creating cards."""
+    available: dict[str, bool] = {}
+    for name in table_names:
+        try:
+            table = sdata.tables[name]
+            coordinates = table.obsm.get("X_umap")
+            shape = getattr(coordinates, "shape", ())
+            available[name] = (
+                len(shape) == 2
+                and shape[0] == table.n_obs
+                and shape[1] >= 2
+                and bool(np.isfinite(np.asarray(coordinates, dtype=np.float64)).all(axis=1).any())
+            )
+        except (KeyError, TypeError, ValueError, AttributeError):
+            available[name] = False
+    return available
+
+
 class ViewerWidget(QWidget):
     """Shared viewer widget backed by `HarpyAppState` and `ViewerAdapter`."""
 
@@ -108,6 +170,11 @@ class ViewerWidget(QWidget):
         self._expanded_labels_names: set[str] = set()
         self._expanded_image_names: set[str] = set()
         self._expanded_shapes_names: set[str] = set()
+        # Whether a points value-source load has been deferred until the Points
+        # section is opened (avoids an eager transcript scan on spawn).
+        self._points_value_source_load_pending = False
+        # Open (non-modal) per-category colour editors, held so they are not GC'd while shown.
+        self._open_category_color_editors: list[CategoryColorEditor] = []
         self._logo_path = get_logo_path()
 
         root_layout = QVBoxLayout(self)
@@ -245,6 +312,8 @@ class ViewerWidget(QWidget):
         self.points_group.content_layout.addWidget(self.points_widget)
         self.points_section_toggle = self.points_group.toggle_button
         self.points_section_title = self.points_section_toggle
+        # Lazily load the points value source only when the user opens the section (perf).
+        self.points_group.toggle_button.toggled.connect(self._on_points_section_toggled)
 
         self.content_layout.addWidget(header_logo)
         self.content_layout.addWidget(self.open_sdata_button)
@@ -310,6 +379,7 @@ class ViewerWidget(QWidget):
 
     def _on_sdata_changed(self, sdata: SpatialData | None) -> None:
         """Refresh the widget when the shared loaded `SpatialData` changes."""
+        self._close_open_category_color_editors()
         self.refresh_from_sdata(sdata)
 
     def _on_coordinate_system_changed(self, index: int) -> None:
@@ -553,8 +623,12 @@ class ViewerWidget(QWidget):
             card = _LabelsCardWidget(
                 labels_name=labels_name,
                 table_color_sources_by_table=table_color_sources_by_table,
+                table_layers_by_table=_table_expression_layers(sdata, table_names),
+                table_smoothers_by_table=_table_smoothers(sdata, table_names),
+                table_umap_by_table=_table_umap_available(sdata, table_names),
             )
             card.add_update_requested.connect(self._add_or_update_labels_layer)
+            card.edit_colors_requested.connect(self._edit_labels_category_colors)
             row = _DisclosureElementWidget(
                 title=labels_name,
                 object_name=f"viewer_widget_labels_row_{labels_name}",
@@ -582,7 +656,12 @@ class ViewerWidget(QWidget):
             table_color_sources_by_table = {
                 table_name: get_table_color_source_options(sdata, table_name) for table_name in table_names
             }
-            card.set_linked_tables(table_color_sources_by_table)
+            card.set_linked_tables(
+                table_color_sources_by_table,
+                table_layers_by_table=_table_expression_layers(sdata, table_names),
+                table_smoothers_by_table=_table_smoothers(sdata, table_names),
+                table_umap_by_table=_table_umap_available(sdata, table_names),
+            )
 
     def _refresh_shapes_card_linked_tables(self) -> None:
         sdata = self._app_state.sdata
@@ -594,7 +673,12 @@ class ViewerWidget(QWidget):
             table_color_sources_by_table = {
                 table_name: get_table_color_source_options(sdata, table_name) for table_name in table_names
             }
-            card.set_linked_tables(table_color_sources_by_table)
+            card.set_linked_tables(
+                table_color_sources_by_table,
+                table_layers_by_table=_table_expression_layers(sdata, table_names),
+                table_smoothers_by_table=_table_smoothers(sdata, table_names),
+                table_umap_by_table=_table_umap_available(sdata, table_names),
+            )
 
     def _rebuild_shapes_cards(self, sdata: SpatialData, shapes_names: list[str]) -> None:
         _clear_layout(self.shapes_section_layout)
@@ -611,8 +695,12 @@ class ViewerWidget(QWidget):
                 shapes_name=shapes_name,
                 shape_column_color_sources=get_shape_column_color_source_options(sdata, shapes_name),
                 table_color_sources_by_table=table_color_sources_by_table,
+                table_layers_by_table=_table_expression_layers(sdata, table_names),
+                table_smoothers_by_table=_table_smoothers(sdata, table_names),
+                table_umap_by_table=_table_umap_available(sdata, table_names),
             )
             card.add_update_requested.connect(self._add_or_update_shapes_layer)
+            card.edit_colors_requested.connect(self._edit_shapes_category_colors)
             row = _DisclosureElementWidget(
                 title=shapes_name,
                 object_name=f"viewer_widget_shapes_row_{shapes_name}",
@@ -660,10 +748,27 @@ class ViewerWidget(QWidget):
         if changed:
             self._last_points_load_request = None
             self._last_points_load_result = None
-        if changed and self._points_controller.can_load_values:
-            self._points_controller.load_value_source()
+            # Defer the value-source scan (a full Dask pass over the transcripts to
+            # validate columns and count values) until the user actually opens the
+            # Points section. Binding on sdata load must stay cheap: this scan used
+            # to run on spawn for the auto-selected points element, before the user
+            # asked to work with points at all.
+            self._points_value_source_load_pending = self._points_controller.can_load_values
+
+        if self._points_value_source_load_pending and self.points_group.is_expanded():
+            self._load_points_value_source_if_pending()
         else:
             self.points_widget.render_controller_state(self._points_controller)
+
+    def _load_points_value_source_if_pending(self) -> None:
+        if self._points_value_source_load_pending and self._points_controller.can_load_values:
+            self._points_value_source_load_pending = False
+            self._points_controller.load_value_source()
+
+    def _on_points_section_toggled(self, expanded: bool) -> None:
+        # Load the deferred points value source the first time the user opens the section.
+        if expanded:
+            self._load_points_value_source_if_pending()
 
     def _add_or_update_points_selection(self, values: Sequence[str] | Literal["all"], render_point_budget: int) -> None:
         self._last_points_load_request = None
@@ -802,6 +907,12 @@ class ViewerWidget(QWidget):
                     f"The selected observation column is not available in the linked table for "
                     f'"{request.labels_name}". Pick another observation column.'
                 )
+            elif request.selected_source_kind == "x_module":
+                line = (
+                    f'The gene module is not valid for the linked table for "{request.labels_name}". '
+                    "Enter at least two distinct genes that exist in the table. "
+                    "UMAP smoothing also requires X_umap; disable it when using an already smoothed layer."
+                )
             else:
                 line = (
                     f'The selected var is not available in the linked table for "{request.labels_name}". '
@@ -875,7 +986,7 @@ class ViewerWidget(QWidget):
             )
             return
 
-        if request.selected_source_kind in {"obs_column", "x_var"} and request.table_name is None:
+        if request.selected_source_kind in {"obs_column", "x_var", "x_module"} and request.table_name is None:
             self._set_action_feedback(
                 title="Styled Shapes Error",
                 lines=[f'Shapes element "{request.shapes_name}" has no linked table for table-driven coloring.'],
@@ -893,6 +1004,12 @@ class ViewerWidget(QWidget):
                 line = (
                     f'The selected var is not available in the linked table for "{request.shapes_name}". '
                     "Pick another var."
+                )
+            elif request.selected_source_kind == "x_module":
+                line = (
+                    f'The gene module is not valid for the linked table for "{request.shapes_name}". '
+                    "Enter at least two distinct genes that exist in the table. "
+                    "UMAP smoothing also requires X_umap; disable it when using an already smoothed layer."
                 )
             else:
                 line = (
@@ -923,6 +1040,95 @@ class ViewerWidget(QWidget):
             self.global_action_feedback_label,
             build_styled_shapes_card_spec(request, result),
         )
+
+    def _edit_shapes_category_colors(self, request: ShapesLoadRequest) -> None:
+        editor = self._open_category_color_editor(
+            table_name=request.table_name,
+            color_source=request.selected_color_source,
+            allow_alpha=False,  # shapes styling forces its own edge/face alpha
+        )
+        if editor is None:
+            return
+        # Re-style the shapes layer whenever the palette is (re)written, so edits show immediately.
+        editor.colors_changed.connect(lambda: self._add_or_update_styled_shapes_layer(request))
+        editor.show()
+
+    def _edit_labels_category_colors(self, request: LabelsLoadRequest) -> None:
+        editor = self._open_category_color_editor(
+            table_name=request.table_name,
+            color_source=request.selected_color_source,
+            allow_alpha=True,  # the labels colormap honours per-category RGBA
+        )
+        if editor is None:
+            return
+        # Re-style the labels layer whenever the palette is (re)written, so edits show immediately.
+        editor.colors_changed.connect(lambda: self._add_or_update_styled_labels_layer(request))
+        editor.show()
+
+    def _open_category_color_editor(
+        self,
+        *,
+        table_name: str | None,
+        color_source: TableColorSourceSpec | None,
+        allow_alpha: bool,
+    ) -> CategoryColorEditor | None:
+        """Open a per-category colour editor for a categorical obs color source, or report why not.
+
+        Returns ``None`` (and shows feedback) when the source is not an editable categorical obs
+        column. If an editor for the same table/column is already open, it is raised to the front
+        and ``None`` is returned so the caller does not stack a duplicate.
+        """
+        sdata = self._app_state.sdata
+        value_key = color_source.value_key if color_source is not None else None
+        source_kind = color_source.source_kind if color_source is not None else None
+        if sdata is None or table_name is None or value_key is None or source_kind != "obs_column":
+            self._set_action_feedback(
+                title="Edit Colours",
+                lines=["Select a linked-table observation column to edit its category colours."],
+                kind="error",
+            )
+            return None
+
+        table = sdata[table_name]
+        if not is_editable_category_column(table, value_key):
+            self._set_action_feedback(
+                title="Edit Colours",
+                lines=[
+                    f'Observation column "{value_key}" is not categorical; per-category colours apply to '
+                    "categorical columns only."
+                ],
+                kind="error",
+            )
+            return None
+
+        existing = self._find_open_category_color_editor(table, value_key)
+        if existing is not None:
+            existing.raise_()
+            existing.activateWindow()
+            return None
+
+        editor = CategoryColorEditor(table, value_key, allow_alpha=allow_alpha, parent=self)
+        # Keep a reference so the non-modal editor is not garbage-collected while open.
+        self._open_category_color_editors.append(editor)
+        editor.finished.connect(lambda _result, editor=editor: self._forget_category_color_editor(editor))
+        return editor
+
+    def _find_open_category_color_editor(self, table: object, column: str) -> CategoryColorEditor | None:
+        for editor in self._open_category_color_editors:
+            if editor.column == column and editor.table is table:
+                return editor
+        return None
+
+    def _forget_category_color_editor(self, editor: CategoryColorEditor) -> None:
+        if editor in self._open_category_color_editors:
+            self._open_category_color_editors.remove(editor)
+
+    def _close_open_category_color_editors(self) -> None:
+        # Editors hold a reference to a specific table; close them when the loaded data changes
+        # so an Apply can never write to a detached table the viewer no longer renders from.
+        for editor in list(self._open_category_color_editors):
+            editor.close()
+        self._open_category_color_editors.clear()
 
     def _add_or_update_image_layer(self, request: ImageLoadRequest) -> None:
         sdata = self._app_state.sdata

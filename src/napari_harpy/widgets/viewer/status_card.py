@@ -191,9 +191,7 @@ def build_styled_shapes_card_spec(
     if result.shapes_rendering_mode == "points":
         lines.append("Rendered point-radius shapes as napari points for faster display.")
     tooltip_message = (
-        f'{action} styled shapes layer for {source_text} on shapes element "{shapes_name}".'
-        if was_shortened
-        else None
+        f'{action} styled shapes layer for {source_text} on shapes element "{shapes_name}".' if was_shortened else None
     )
     title = f"Styled Shapes {action}"
     kind = _append_palette_status_lines(
@@ -260,12 +258,21 @@ def _format_image_overlay_channels(result: ImageLoadResult) -> str:
 def _format_table_color_source(color_source: TableColorSourceSpec) -> str:
     if color_source.source_kind == "obs_column":
         return f'obs["{color_source.value_key}"]'
-    return f'X[:, "{color_source.value_key}"]'
+    layer = getattr(color_source, "layer", None) or "X"
+    smoother = getattr(color_source, "smoother", None)
+    matrix = f"{layer}~{smoother}" if smoother else layer
+    if color_source.source_kind == "x_module":
+        umap_neighbors = getattr(color_source, "umap_neighbors", None)
+        if umap_neighbors is not None:
+            matrix = f"{layer}~UMAP-k{umap_neighbors}"
+        genes = ", ".join(f'"{gene}"' for gene in getattr(color_source, "module_genes", ()))
+        return f"mean z-score of {matrix}[:, [{genes}]]"
+    return f'{matrix}[:, "{color_source.value_key}"]'
 
 
 def _format_shapes_color_source(color_source: object) -> str:
     source_kind = getattr(color_source, "source_kind", None)
-    if source_kind in {"obs_column", "x_var"}:
+    if source_kind in {"obs_column", "x_var", "x_module"}:
         return _format_table_color_source(color_source)
     return f'column "{color_source.value_key}"'
 

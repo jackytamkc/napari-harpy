@@ -5,6 +5,7 @@ import geopandas as gpd
 import numpy as np
 import pandas as pd
 import pytest
+import scipy.sparse as sp
 from matplotlib.colors import to_rgba
 from napari.layers import Points, Shapes
 from napari.utils.colormaps import label_colormap
@@ -170,6 +171,48 @@ def test_align_table_color_source_to_shapes_rows_extracts_x_var_values_from_regi
     assert aligned.source_row_values.to_list() == [10.0, 30.0]
     assert aligned.rendered_row_values.to_list() == [30.0, 10.0]
     assert aligned.rendered_row_has_table_row.tolist() == [True, True]
+
+
+def test_align_table_color_source_to_shapes_rows_extracts_module_scores_from_selected_layer() -> None:
+    geodataframe = gpd.GeoDataFrame(
+        {},
+        geometry=[_polygon(0), _polygon(2)],
+        index=pd.Index(["cell_1", "cell_2"], name="instance_id"),
+    )
+    table = ad.AnnData(
+        X=np.zeros((3, 2), dtype="float64"),
+        obs=pd.DataFrame(
+            {
+                "region": ["cells", "other", "cells"],
+                "instance_id": ["cell_1", "other_1", "cell_2"],
+            },
+            index=["obs_1", "obs_2", "obs_3"],
+        ),
+        var=pd.DataFrame(index=["GeneA", "GeneB"]),
+    )
+    selected_matrix = np.asarray([[1.0, 9.0], [2.0, 4.0], [8.0, 1.0]])
+    table.layers["smoothed_k100"] = selected_matrix
+    expected_full = ((selected_matrix - selected_matrix.mean(axis=0)) / selected_matrix.std(axis=0)).mean(axis=1)
+    style_spec = TableColorSourceSpec(
+        table_name="table",
+        source_kind="x_module",
+        value_key="GeneA + GeneB",
+        value_kind="continuous",
+        layer="smoothed_k100",
+        module_genes=("GeneA", "GeneB"),
+    )
+
+    aligned = _align_table_color_source_to_shapes_rows(
+        table=table,
+        table_metadata=_table_metadata(regions=("cells", "other")),
+        shapes_name="cells",
+        shapes_element=geodataframe,
+        style_spec=style_spec,
+        source_row_id_by_rendered_row=(1, 0),
+    )
+
+    np.testing.assert_allclose(aligned.source_row_values.to_numpy(dtype="float64"), expected_full[[0, 2]])
+    np.testing.assert_allclose(aligned.rendered_row_values.to_numpy(dtype="float64"), expected_full[[2, 0]])
 
 
 def test_align_table_color_source_to_shapes_rows_preserves_instance_key_values_for_identity_coloring() -> None:
@@ -361,8 +404,45 @@ def test_align_table_color_source_to_shapes_rows_rejects_instance_key_column_whe
         )
 
 
-def test_align_table_color_source_to_shapes_rows_requires_shapes_instance_identity() -> None:
+def test_align_table_color_source_to_shapes_rows_accepts_unnamed_index_as_instance_identity() -> None:
+    # spatialdata-io / sopa leave the shapes index unnamed even though its values already are the
+    # instance identities; table-backed styling must work without first renaming the index.
+    geodataframe = gpd.GeoDataFrame(
+        {},
+        geometry=[_polygon(0), _polygon(2)],
+        index=pd.Index(["cell_1", "cell_2"]),
+    )
+    assert geodataframe.index.name is None
+    table = ad.AnnData(
+        obs=pd.DataFrame(
+            {"region": ["cells", "cells"], "instance_id": ["cell_1", "cell_2"], "cell_type": ["T", "B"]},
+            index=["obs_1", "obs_2"],
+        )
+    )
+    style_spec = TableColorSourceSpec(
+        table_name="table",
+        source_kind="obs_column",
+        value_key="cell_type",
+        value_kind="categorical",
+    )
+
+    aligned = _align_table_color_source_to_shapes_rows(
+        table=table,
+        table_metadata=_table_metadata(),
+        shapes_name="cells",
+        shapes_element=geodataframe,
+        style_spec=style_spec,
+        source_row_id_by_rendered_row=(0, 1),
+    )
+
+    assert aligned.source_row_values.to_list() == ["T", "B"]
+    assert aligned.source_row_has_table_row.tolist() == [True, True]
+
+
+def test_align_table_color_source_to_shapes_rows_rejects_conflicting_named_index() -> None:
+    # An index explicitly named something *other* than the instance key signals a different identifier.
     geodataframe = gpd.GeoDataFrame({"cell_type": ["T"]}, geometry=[_polygon(0)], index=["shape_a"])
+    geodataframe.index.name = "shape_index"
     table = ad.AnnData(obs=pd.DataFrame({"region": ["cells"], "instance_id": ["cell_1"]}, index=["obs_1"]))
     style_spec = TableColorSourceSpec(
         table_name="table",
@@ -371,7 +451,7 @@ def test_align_table_color_source_to_shapes_rows_requires_shapes_instance_identi
         value_kind="instance",
     )
 
-    with pytest.raises(ValueError, match="must use GeoDataFrame index"):
+    with pytest.raises(ValueError, match="does not match the linked table instance key"):
         _align_table_color_source_to_shapes_rows(
             table=table,
             table_metadata=_table_metadata(),
@@ -1292,5 +1372,77 @@ def test_build_styled_shapes_layer_name_returns_stable_table_variant_names() -> 
         value_kind="continuous",
     )
 
+    layer_style = TableColorSourceSpec(
+        table_name="table",
+        source_kind="x_var",
+        value_key="GeneA",
+        value_kind="continuous",
+        layer="log1p",
+    )
+    module_style = TableColorSourceSpec(
+        table_name="table",
+        source_kind="x_module",
+        value_key="GeneA + GeneB",
+        value_kind="continuous",
+        layer="smoothed_k100",
+        module_genes=("GeneA", "GeneB"),
+    )
+
     assert build_styled_shapes_layer_name("cell_boundaries", obs_style) == "cell_boundaries[obs:cell_type]"
     assert build_styled_shapes_layer_name("cell_boundaries", x_style) == "cell_boundaries[X:GeneA]"
+    # A var from a non-X layer is a distinct layer name, so X and log1p don't collide.
+    assert build_styled_shapes_layer_name("cell_boundaries", layer_style) == "cell_boundaries[log1p:GeneA]"
+    assert (
+        build_styled_shapes_layer_name("cell_boundaries", module_style)
+        == "cell_boundaries[smoothed_k100:module:GeneA + GeneB]"
+    )
+
+
+def test_align_table_color_source_to_shapes_rows_applies_obsp_smoother() -> None:
+    geodataframe = gpd.GeoDataFrame(
+        {},
+        geometry=[_polygon(0), _polygon(2)],
+        index=pd.Index(["c0", "c1"], name="instance_id"),
+    )
+    table = ad.AnnData(
+        X=np.array([[1.0, 2.0], [3.0, 4.0]], dtype="float32"),  # GeneB column = [2, 4]
+        obs=pd.DataFrame({"region": ["cells", "cells"], "instance_id": ["c0", "c1"]}, index=["c0", "c1"]),
+        var=pd.DataFrame(index=["GeneA", "GeneB"]),
+    )
+    table.obsp["smoother_k100"] = sp.csr_matrix(np.array([[0.5, 0.5], [0.5, 0.5]], dtype="float32"))
+    style_spec = TableColorSourceSpec(
+        table_name="table",
+        source_kind="x_var",
+        value_key="GeneB",
+        value_kind="continuous",
+        smoother="smoother_k100",
+    )
+
+    aligned = _align_table_color_source_to_shapes_rows(
+        table=table,
+        table_metadata=_table_metadata(),
+        shapes_name="cells",
+        shapes_element=geodataframe,
+        style_spec=style_spec,
+        source_row_id_by_rendered_row=(0, 1),
+    )
+    # The styling path must route style_spec.smoother through to the live A @ column smoothing:
+    # GeneB [2, 4] averaged over both neighbours -> [3, 3].
+    np.testing.assert_allclose(aligned.source_row_values.to_numpy(dtype="float64"), [3.0, 3.0])
+
+
+def test_copy_rgba_with_alpha_preserves_hidden_alpha_zero_rows() -> None:
+    from napari_harpy.viewer.shapes_styling import _copy_rgba_with_alpha
+
+    colors = np.asarray(
+        [
+            [1.0, 0.0, 0.0, 1.0],  # visible category
+            [0.0, 1.0, 0.0, 0.0],  # hidden category (alpha 0 from an alpha-0 palette entry)
+            [0.5, 0.5, 0.5, 0.6],  # missing-value gray
+        ],
+        dtype="float64",
+    )
+    out = _copy_rgba_with_alpha(colors, SHAPES_FACE_ALPHA, row_count=3, row_kind="shape")
+    assert out[0, 3] == SHAPES_FACE_ALPHA  # visible row -> forced face alpha
+    assert out[1, 3] == 0.0  # hidden row -> stays transparent
+    assert out[2, 3] == SHAPES_FACE_ALPHA  # missing gray -> visible

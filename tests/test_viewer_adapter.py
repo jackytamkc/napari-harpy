@@ -1536,6 +1536,35 @@ def test_viewer_adapter_ensure_styled_labels_loaded_reuses_matching_variant(sdat
     assert len(viewer.layers) == 1
 
 
+def test_viewer_adapter_ensure_styled_labels_loaded_restyles_in_place_on_colormap_change(sdata_blobs) -> None:
+    # A colormap-only change must re-style the SAME layer, not fork a duplicate with a colliding
+    # name: colormap is a display property and (unlike layer/smoother) is absent from the layer name.
+    viewer = DummyViewer()
+    adapter = ViewerAdapter(viewer)
+    base = TableColorSourceSpec(
+        table_name="table", source_kind="x_var", value_key="channel_0_sum", value_kind="continuous"
+    )
+    recolored = TableColorSourceSpec(
+        table_name="table", source_kind="x_var", value_key="channel_0_sum", value_kind="continuous", colormap="inferno"
+    )
+
+    first = adapter.ensure_styled_labels_loaded(sdata_blobs, "blobs_labels", "global", base)
+    before = dict(first.layer.colormap.color_dict)
+    second = adapter.ensure_styled_labels_loaded(sdata_blobs, "blobs_labels", "global", recolored)
+
+    assert first.layer is second.layer  # reused, not forked
+    assert second.created is False
+    assert len(viewer.layers) == 1  # no duplicate colliding-named ghost layer
+    # the binding now carries the current colormap, so preset capture and later reuse see it
+    binding = adapter.layer_bindings.get_binding(second.layer)
+    assert binding.style_spec.colormap == "inferno"
+    # and the reused layer was actually re-colored
+    after = dict(second.layer.colormap.color_dict)
+    assert any(
+        isinstance(key, int) and key > 0 and not np.array_equal(before[key], after[key]) for key in before
+    ), "the colormap change did not re-color the reused layer"
+
+
 def test_viewer_adapter_ensure_styled_labels_loaded_creates_distinct_variants_for_different_style_specs(
     sdata_blobs,
 ) -> None:
@@ -2521,21 +2550,19 @@ def test_viewer_adapter_ensure_styled_shapes_loaded_creates_table_backed_variant
     assert result.palette_source == "stored"
     assert result.coercion_applied is False
     assert result.unannotated_source_shape_count == 1
-    assert result.unannotated_rendered_shape_count == 1
+    assert result.unannotated_rendered_shape_count == 0
     assert result.layer in viewer.layers
     assert result.layer.name == "cell_boundaries[obs:cell_type]"
     assert adapter.get_loaded_primary_shapes_layer(sdata, "cell_boundaries", "global") is None
     binding = get_shapes_binding(adapter, result.layer)
     assert binding.shapes_role == "styled"
     assert binding.style_spec == style_spec
-    assert binding.source_row_id_by_rendered_row == (0, 1, 2)
+    assert binding.source_row_id_by_rendered_row == (0, 1)
     assert list(result.layer.features.columns) == ["instance_id", "cell_type"]
-    assert result.layer.features["instance_id"].to_list() == ["cell_1", "cell_2", "cell_3"]
-    assert result.layer.features["cell_type"].to_list()[:2] == ["T", "B"]
-    assert pd.isna(result.layer.features["cell_type"].iloc[2])
+    assert result.layer.features["instance_id"].to_list() == ["cell_1", "cell_2"]
+    assert result.layer.features["cell_type"].to_list() == ["T", "B"]
     np.testing.assert_allclose(result.layer.edge_color[0], (*to_rgba("#ff0000")[:3], 1.0))
     np.testing.assert_allclose(result.layer.edge_color[1], (*to_rgba("#00ff00")[:3], 1.0))
-    assert result.layer.edge_color[2, 3] == 0.0
 
 
 def test_viewer_adapter_ensure_styled_shapes_loaded_creates_point_backed_table_variant() -> None:
@@ -2707,15 +2734,13 @@ def test_viewer_adapter_table_backed_shapes_uses_named_index_as_instance_key() -
     result = adapter.ensure_styled_shapes_loaded(sdata, "cell_boundaries", "global", style_spec)
 
     binding = get_shapes_binding(adapter, result.layer)
-    assert binding.source_row_id_by_rendered_row == (0, 1, 2)
+    assert binding.source_row_id_by_rendered_row == (0, 1)
     assert binding.source_shapes_index_feature_name == "instance_id"
     assert list(result.layer.features.columns) == ["instance_id", "cell_type"]
-    assert result.layer.features["instance_id"].to_list() == ["cell_1", "cell_2", "cell_3"]
-    assert result.layer.features["cell_type"].to_list()[:2] == ["T", "B"]
-    assert pd.isna(result.layer.features["cell_type"].iloc[2])
+    assert result.layer.features["instance_id"].to_list() == ["cell_1", "cell_2"]
+    assert result.layer.features["cell_type"].to_list() == ["T", "B"]
     np.testing.assert_allclose(result.layer.edge_color[0], (*to_rgba("#ff0000")[:3], 1.0))
     np.testing.assert_allclose(result.layer.edge_color[1], (*to_rgba("#00ff00")[:3], 1.0))
-    assert result.layer.edge_color[2, 3] == 0.0
 
 
 def test_viewer_adapter_table_backed_shapes_allows_duplicate_instance_index() -> None:
@@ -2785,10 +2810,8 @@ def test_viewer_adapter_ensure_styled_shapes_loaded_reuses_table_backed_variant_
     assert second.layer is first.layer
     assert second.created is False
     assert len(viewer.layers) == 1
-    np.testing.assert_allclose(first.layer.face_color[:2, 3], np.full(2, SHAPES_FACE_ALPHA))
-    assert first.layer.face_color[2, 3] == 0.0
-    np.testing.assert_allclose(first.layer.edge_color[:2, 3], np.ones(2))
-    assert first.layer.edge_color[2, 3] == 0.0
+    np.testing.assert_allclose(first.layer.face_color[:, 3], np.full(2, SHAPES_FACE_ALPHA))
+    np.testing.assert_allclose(first.layer.edge_color[:, 3], np.ones(2))
 
 
 def test_viewer_adapter_ensure_styled_shapes_loaded_updates_fill_alpha_on_existing_variant() -> None:
@@ -2910,6 +2933,29 @@ def test_viewer_adapter_ensure_styled_shapes_loaded_reuses_matching_variant() ->
     assert second.created is False
     assert second.value_kind == "continuous"
     assert len(viewer.layers) == 1
+
+
+def test_viewer_adapter_ensure_styled_shapes_loaded_restyles_in_place_on_colormap_change() -> None:
+    # As for labels: a colormap-only change reuses and re-styles the shapes layer rather than
+    # forking a duplicate with a colliding name.
+    sdata = make_colorable_shapes_sdata()
+    viewer = DummyViewer()
+    adapter = ViewerAdapter(viewer)
+    base = ShapeColumnColorSourceSpec(source_kind="shape_column", value_key="score", value_kind="continuous")
+    recolored = ShapeColumnColorSourceSpec(
+        source_kind="shape_column", value_key="score", value_kind="continuous", colormap="inferno"
+    )
+
+    first = adapter.ensure_styled_shapes_loaded(sdata, "cell_boundaries", "global", base)
+    before = np.asarray(first.layer.face_color).copy()
+    second = adapter.ensure_styled_shapes_loaded(sdata, "cell_boundaries", "global", recolored)
+
+    assert first.layer is second.layer
+    assert second.created is False
+    assert len(viewer.layers) == 1
+    binding = adapter.layer_bindings.get_binding(second.layer)
+    assert binding.style_spec.colormap == "inferno"
+    assert not np.allclose(before, np.asarray(second.layer.face_color)), "the reused layer was not re-colored"
 
 
 def test_viewer_adapter_ensure_styled_shapes_loaded_creates_distinct_variants_for_different_style_specs() -> None:

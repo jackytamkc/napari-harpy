@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 from loguru import logger
 from matplotlib import rcParams
+from matplotlib.colors import to_hex
 from scanpy.plotting.palettes import default_20, default_28, default_102
 
 if TYPE_CHECKING:
@@ -95,7 +96,11 @@ def default_labeled_class_color(class_id: int) -> str:
     """Return the deterministic default color for one positive class id."""
     palette_index = _class_palette_index(class_id)
     palette = default_categorical_colors(palette_index + 1)
-    return palette[palette_index]
+    # Matplotlib/Scanpy palettes may contain RGB(A) tuples depending on global
+    # rcParams.  Persisting ``str(tuple)`` later produces a value that napari's
+    # DirectLabelColormap cannot parse.  Canonical hex works for every source
+    # representation and remains stable across zarr round-trips.
+    return to_hex(palette[palette_index], keep_alpha=True)
 
 
 def normalize_color_sequence(value: object) -> list[str] | None:

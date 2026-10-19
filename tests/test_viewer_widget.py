@@ -4,6 +4,7 @@ from collections.abc import Callable
 from html import unescape
 from types import SimpleNamespace
 
+import anndata as ad
 import dask
 import dask.dataframe as dd
 import geopandas as gpd
@@ -73,9 +74,7 @@ class DummyViewer:
         self.layers = DummyLayers()
 
 
-_FEEDBACK_BACKGROUND_BY_KIND = {
-    kind: palette["background"] for kind, palette in STATUS_CARD_PALETTE.items()
-}
+_FEEDBACK_BACKGROUND_BY_KIND = {kind: palette["background"] for kind, palette in STATUS_CARD_PALETTE.items()}
 
 
 def _assert_action_feedback_card(widget: ViewerWidget, *, title: str, kind: str) -> None:
@@ -192,6 +191,18 @@ def _make_colorable_shapes_sdata(
 def _select_shape_column(card: object, value_key: str) -> None:
     card.color_source_kind_combo.setCurrentIndex(1)
     card.color_source_value_input.setText(value_key)
+
+
+def _select_card_value(card: object, value_key: str) -> None:
+    """Set the colour-source value via whichever widget the card currently shows.
+
+    Observation columns use a dropdown (`color_source_value_combo`); shape columns and vars
+    use the type-to-filter line edit (`color_source_value_input`).
+    """
+    if card.color_source_value_stack.currentWidget() is card.color_source_value_combo:
+        card.color_source_value_combo.setCurrentText(value_key)
+    else:
+        card.color_source_value_input.setText(value_key)
 
 
 def _make_points_load_request(sdata: object) -> PointsLoadRequest:
@@ -424,7 +435,7 @@ def test_viewer_widget_summary_card_shortens_long_coordinate_system(
     assert 'In coordinate system "' in tooltip
 
 
-def test_viewer_widget_points_section_populates_and_starts_value_loading(qtbot, monkeypatch) -> None:
+def test_viewer_widget_points_section_defers_value_loading_until_expanded(qtbot, monkeypatch) -> None:
     viewer = DummyViewer()
     widget = ViewerWidget(viewer)
     fake_sdata = _make_points_sdata()
@@ -459,7 +470,17 @@ def test_viewer_widget_points_section_populates_and_starts_value_loading(qtbot, 
         widget.points_widget.index_column_combo.itemText(index)
         for index in range(widget.points_widget.index_column_combo.count())
     ] == ["gene", "target"]
+    # The Points section is collapsed on spawn, so the (potentially expensive) value-source
+    # scan is deferred rather than run eagerly on bind.
+    assert not widget.points_group.is_expanded()
+    assert widget._points_value_source_load_pending is True
+    assert load_value_calls == 0
+
+    # Opening the section triggers the deferred load exactly once.
+    widget.points_section_toggle.setChecked(True)
+    assert widget.points_group.is_expanded()
     assert load_value_calls == 1
+    assert widget._points_value_source_load_pending is False
 
 
 def test_viewer_widget_points_add_update_request_calls_controller(qtbot, monkeypatch) -> None:
@@ -603,11 +624,7 @@ def test_viewer_widget_expanded_detail_panels_fit_current_minimum_width(qtbot, m
         group_margins = group.layout().contentsMargins()
         row_margins = row.layout().contentsMargins()
         available_detail_width = (
-            content_width
-            - group_margins.left()
-            - group_margins.right()
-            - row_margins.left()
-            - row_margins.right()
+            content_width - group_margins.left() - group_margins.right() - row_margins.left() - row_margins.right()
         )
 
         assert card.minimumSizeHint().width() <= available_detail_width
@@ -707,19 +724,20 @@ def test_viewer_widget_labels_cards_expose_table_driven_coloring_controls(qtbot,
     first_card = widget.labels_cards[0]
     second_card = widget.labels_cards[1]
 
-    assert first_card.color_source_kind_combo.count() == 3
-    assert [first_card.color_source_kind_combo.itemText(index) for index in range(3)] == [
+    assert first_card.color_source_kind_combo.count() == 4
+    assert [first_card.color_source_kind_combo.itemText(index) for index in range(4)] == [
         "None",
         "Observations",
         "Vars",
+        "Gene module",
     ]
     assert first_card.color_source_value_input.completer() is not None
     assert not first_card.color_source_value_input.isEnabled()
     assert first_card.action_hint_label.text() == "Action: add/update primary labels layer"
 
     first_card.color_source_kind_combo.setCurrentIndex(1)
-    assert first_card.color_source_value_input.isEnabled()
-    assert first_card.color_source_value_input.completer().model().stringList() == ["instance_id"]
+    assert first_card.color_source_value_combo.isEnabled()  # observations use a scrollable dropdown
+    assert _combo_texts(first_card.color_source_value_combo) == ["instance_id"]
     assert first_card.action_hint_label.text() == 'Action: add/update colored overlay for obs["instance_id"]'
 
     first_card.color_source_kind_combo.setCurrentIndex(2)
@@ -774,12 +792,12 @@ def test_viewer_widget_labels_card_repopulates_color_sources_when_linked_table_c
     card = widget.labels_cards[0]
 
     card.color_source_kind_combo.setCurrentIndex(1)
-    assert card.color_source_value_input.isEnabled()
-    assert card.color_source_value_input.completer().model().stringList() == ["cell_type"]
+    assert card.color_source_value_combo.isEnabled()  # observations use a scrollable dropdown
+    assert _combo_texts(card.color_source_value_combo) == ["cell_type"]
     assert card.action_hint_label.text() == 'Action: add/update colored overlay for obs["cell_type"]'
 
     card.linked_table_combo.setCurrentIndex(1)
-    assert not card.color_source_value_input.isEnabled()
+    assert not card.color_source_value_combo.isEnabled()  # observations use the dropdown
     assert card.action_hint_label.text() == "Action: no colorable observation columns available"
 
     card.color_source_kind_combo.setCurrentIndex(2)
@@ -1015,7 +1033,7 @@ def test_viewer_widget_refreshes_table_color_sources_from_classification_table_e
 
     card = widget.labels_cards[0]
     card.color_source_kind_combo.setCurrentIndex(1)
-    assert card._color_source_completer_model.stringList() == ["cell_type"]
+    assert _combo_texts(card.color_source_value_combo) == ["cell_type"]
 
     color_sources_by_table["table"] = [
         *color_sources_by_table["table"],
@@ -1041,7 +1059,7 @@ def test_viewer_widget_refreshes_table_color_sources_from_classification_table_e
         )
     )
 
-    assert card._color_source_completer_model.stringList() == ["cell_type", "user_class", "pred_class"]
+    assert _combo_texts(card.color_source_value_combo) == ["cell_type", "user_class", "pred_class"]
     assert card.selected_table_name == "table"
     assert card.selected_source_kind == "obs_column"
     assert len(viewer.layers) == 0
@@ -1097,7 +1115,7 @@ def test_viewer_widget_ignores_classification_table_events_for_other_sdata(qtbot
         )
     )
 
-    assert card._color_source_completer_model.stringList() == ["cell_type"]
+    assert _combo_texts(card.color_source_value_combo) == ["cell_type"]
 
 
 def test_viewer_widget_refreshes_only_shapes_section_from_shapes_element_event(qtbot, monkeypatch) -> None:
@@ -1114,10 +1132,18 @@ def test_viewer_widget_refreshes_only_shapes_section_from_shapes_element_event(q
     qtbot.addWidget(widget)
 
     _patch_coordinate_system_names(monkeypatch, ["global"])
-    monkeypatch.setattr(viewer_widget_module, "_get_images_in_coordinate_system", lambda sdata, coordinate_system: names["images"])
-    monkeypatch.setattr(viewer_widget_module, "_get_labels_in_coordinate_system", lambda sdata, coordinate_system: names["labels"])
-    monkeypatch.setattr(viewer_widget_module, "_get_shapes_in_coordinate_system", lambda sdata, coordinate_system: names["shapes"])
-    monkeypatch.setattr(viewer_widget_module, "_get_points_in_coordinate_system", lambda sdata, coordinate_system: names["points"])
+    monkeypatch.setattr(
+        viewer_widget_module, "_get_images_in_coordinate_system", lambda sdata, coordinate_system: names["images"]
+    )
+    monkeypatch.setattr(
+        viewer_widget_module, "_get_labels_in_coordinate_system", lambda sdata, coordinate_system: names["labels"]
+    )
+    monkeypatch.setattr(
+        viewer_widget_module, "_get_shapes_in_coordinate_system", lambda sdata, coordinate_system: names["shapes"]
+    )
+    monkeypatch.setattr(
+        viewer_widget_module, "_get_points_in_coordinate_system", lambda sdata, coordinate_system: names["points"]
+    )
     monkeypatch.setattr(viewer_widget_module, "get_image_channel_names_from_sdata", lambda sdata, image_name: ["c0"])
     monkeypatch.setattr(viewer_widget_module, "get_annotating_table_names", lambda sdata, element_name: [])
     monkeypatch.setattr(viewer_widget_module, "get_table_color_source_options", lambda sdata, table_name: [])
@@ -1583,7 +1609,7 @@ def test_viewer_widget_add_update_labels_creates_and_updates_styled_overlay(qtbo
 
     first_card = widget.labels_cards[0]
     first_card.color_source_kind_combo.setCurrentIndex(1)
-    first_card.color_source_value_input.setText("cell_type")
+    _select_card_value(first_card, "cell_type")
 
     first_card.add_update_button.click()
 
@@ -1618,7 +1644,7 @@ def test_viewer_widget_styled_overlay_missing_palette_uses_info_card(qtbot, sdat
 
     first_card = widget.labels_cards[0]
     first_card.color_source_kind_combo.setCurrentIndex(1)
-    first_card.color_source_value_input.setText("cell_type")
+    _select_card_value(first_card, "cell_type")
 
     first_card.add_update_button.click()
 
@@ -1664,7 +1690,7 @@ def test_viewer_widget_styled_overlay_invalid_palette_uses_warning_card(qtbot, s
 
     first_card = widget.labels_cards[0]
     first_card.color_source_kind_combo.setCurrentIndex(1)
-    first_card.color_source_value_input.setText("cell_type")
+    _select_card_value(first_card, "cell_type")
 
     first_card.add_update_button.click()
 
@@ -1685,7 +1711,7 @@ def test_viewer_widget_styled_overlay_string_coercion_uses_warning_card(qtbot, s
 
     first_card = widget.labels_cards[0]
     first_card.color_source_kind_combo.setCurrentIndex(1)
-    first_card.color_source_value_input.setText("sample_type")
+    _select_card_value(first_card, "sample_type")
 
     first_card.add_update_button.click()
 
@@ -1704,9 +1730,18 @@ def test_viewer_widget_styled_overlay_precondition_error_uses_error_card(qtbot, 
 
     first_card = widget.labels_cards[0]
     first_card.color_source_kind_combo.setCurrentIndex(1)
-    first_card.color_source_value_input.setText("not_a_column")
+    # The obs dropdown only offers valid columns, so an invalid one can't be typed. Drive the
+    # handler's defensive branch directly (e.g. the column vanished between selection and apply).
+    from napari_harpy.widgets.viewer.labels_widget import LabelsLoadRequest
 
-    first_card.add_update_button.click()
+    widget._add_or_update_styled_labels_layer(
+        LabelsLoadRequest(
+            labels_name=first_card.labels_name,
+            table_name=first_card.selected_table_name,
+            selected_source_kind="obs_column",
+            selected_color_source=None,
+        )
+    )
 
     _assert_action_feedback_card(widget, title="Styled Labels Error", kind="error")
     assert "The selected observation column is not available" in widget.global_action_feedback_label.text()
@@ -1939,6 +1974,7 @@ def test_viewer_widget_shapes_card_exposes_shape_column_controls(qtbot) -> None:
         "Shapes column",
         "Observations",
         "Vars",
+        "Gene module",
     ]
     assert _combo_texts(card.linked_table_combo) == ["No linked tables"]
     assert not card.linked_table_combo.isEnabled()
@@ -1960,7 +1996,7 @@ def test_viewer_widget_shapes_card_exposes_shape_column_controls(qtbot) -> None:
 
     card.color_source_kind_combo.setCurrentIndex(2)
 
-    assert not card.color_source_value_input.isEnabled()
+    assert not card.color_source_value_combo.isEnabled()  # observations use the dropdown
     assert card.action_hint_label.text() == "Action: table-backed shapes coloring requires a linked table"
 
     card.fill_toggle.setChecked(True)
@@ -2034,13 +2070,13 @@ def test_viewer_widget_shapes_card_exposes_linked_table_sources(qtbot, monkeypat
 
     card.color_source_kind_combo.setCurrentIndex(2)
     assert card.color_source_value_label.text() == "Observation"
-    assert card.color_source_value_input.isEnabled()
-    assert card._color_source_completer_model.stringList() == ["cell_type"]
+    assert card.color_source_value_combo.isEnabled()  # observations use a scrollable dropdown
+    assert _combo_texts(card.color_source_value_combo) == ["cell_type"]
     assert card.selected_color_source == color_sources_by_table["table_a"][0]
     assert card.action_hint_label.text() == 'Action: add/update styled shapes layer for obs["cell_type"]'
 
     card.linked_table_combo.setCurrentIndex(1)
-    assert not card.color_source_value_input.isEnabled()
+    assert not card.color_source_value_combo.isEnabled()  # observations use the dropdown
     assert card.action_hint_label.text() == "Action: no colorable observation columns available"
 
     card.color_source_kind_combo.setCurrentIndex(3)
@@ -2049,6 +2085,51 @@ def test_viewer_widget_shapes_card_exposes_linked_table_sources(qtbot, monkeypat
     assert card._color_source_completer_model.stringList() == ["GeneA"]
     assert card.selected_color_source == color_sources_by_table["table_b"][0]
     assert card.action_hint_label.text() == 'Action: add/update styled shapes layer for X[:, "GeneA"]'
+
+
+def test_viewer_widget_shapes_colormap_injected_for_continuous_sources_only(qtbot, monkeypatch) -> None:
+    viewer = DummyViewer()
+    widget = ViewerWidget(viewer)
+    sdata = _make_colorable_shapes_sdata(cell_type_colors=["red", "blue"])
+    color_sources_by_table = {
+        "table": [
+            TableColorSourceSpec(
+                table_name="table", source_kind="obs_column", value_key="cell_type", value_kind="categorical"
+            ),
+            TableColorSourceSpec(table_name="table", source_kind="x_var", value_key="GeneA", value_kind="continuous"),
+        ]
+    }
+    monkeypatch.setattr(
+        viewer_widget_module,
+        "get_annotating_table_names",
+        lambda sdata, element_name: ["table"] if element_name == "cells" else [],
+    )
+    monkeypatch.setattr(
+        viewer_widget_module,
+        "get_table_color_source_options",
+        lambda sdata, table_name: list(color_sources_by_table["table"]),
+    )
+    qtbot.addWidget(widget)
+    with qtbot.waitSignal(widget.app_state.sdata_changed):
+        widget.app_state.set_sdata(sdata)
+
+    card = widget.shape_cards[0]
+
+    # Categorical obs column -> the colourmap is irrelevant: row hidden, never injected.
+    card.color_source_kind_combo.setCurrentIndex(2)  # obs_column
+    assert card.selected_color_source.value_kind == "categorical"
+    assert card.selected_color_source.colormap is None
+    if hasattr(card._form_layout, "isRowVisible"):
+        assert not card._form_layout.isRowVisible(card.colormap_combo)
+
+    # Continuous gene (x_var) -> row shows; default viridis stays None, an explicit pick is injected.
+    card.color_source_kind_combo.setCurrentIndex(3)  # x_var
+    assert card.selected_color_source.value_kind == "continuous"
+    if hasattr(card._form_layout, "isRowVisible"):
+        assert card._form_layout.isRowVisible(card.colormap_combo)
+    assert card.selected_color_source.colormap is None  # default (viridis) -> None keeps specs minimal
+    card.colormap_combo.setCurrentText("inferno")
+    assert card.selected_color_source.colormap == "inferno"
 
 
 def test_viewer_widget_add_update_shapes_with_table_source_dispatches_to_styled_path(qtbot, monkeypatch) -> None:
@@ -2111,7 +2192,10 @@ def test_viewer_widget_add_update_shapes_with_table_source_dispatches_to_styled_
     assert viewer.layers.selection.active is result_layer
     _assert_action_feedback_card(widget, title="Styled Shapes Created", kind="info")
     assert 'Created styled shapes layer for obs["cell_type"]' in widget.global_action_feedback_label.text()
-    assert "Rendered point-radius shapes as napari points for faster display." in widget.global_action_feedback_label.text()
+    assert (
+        "Rendered point-radius shapes as napari points for faster display."
+        in widget.global_action_feedback_label.text()
+    )
     assert "Used the stored categorical palette." in widget.global_action_feedback_label.text()
     assert "Rendered 1 shape transparent because it has no row in the linked table." in (
         widget.global_action_feedback_label.text()
@@ -2527,3 +2611,419 @@ def test_viewer_widget_shares_app_state_for_same_viewer(qtbot) -> None:
     qtbot.addWidget(second)
 
     assert first.app_state is second.app_state
+
+
+class _TableSdata:
+    def __init__(self, tables: dict[str, ad.AnnData]) -> None:
+        self.tables = tables
+
+    def __getitem__(self, key: str) -> ad.AnnData:
+        return self.tables[key]
+
+
+def _categorical_obs_table() -> ad.AnnData:
+    series = pd.Categorical(["A", "B", "C", "A"], categories=["A", "B", "C"])
+    return ad.AnnData(obs=pd.DataFrame({"scNiche": series}, index=[f"c{index}" for index in range(4)]))
+
+
+def _shapes_obs_color_request(value_key: str = "scNiche", value_kind: str = "categorical") -> ShapesLoadRequest:
+    return ShapesLoadRequest(
+        shapes_name="cells",
+        table_name="table",
+        selected_source_kind="obs_column",
+        selected_color_source=TableColorSourceSpec(
+            table_name="table",
+            source_kind="obs_column",
+            value_key=value_key,
+            value_kind=value_kind,
+        ),
+        fill_shapes=False,
+    )
+
+
+def test_shapes_card_edit_colors_button_enables_for_obs_source_and_emits(qtbot) -> None:
+    from napari_harpy.widgets.viewer.shapes_widget import _ShapesCardWidget
+
+    spec = TableColorSourceSpec(
+        table_name="table", source_kind="obs_column", value_key="scNiche", value_kind="categorical"
+    )
+    card = _ShapesCardWidget(
+        shapes_name="cells",
+        shape_column_color_sources=[],
+        table_color_sources_by_table={"table": [spec]},
+    )
+    qtbot.addWidget(card)
+
+    assert not card.edit_colors_button.isEnabled()  # nothing selected yet
+
+    card.color_source_kind_combo.setCurrentIndex(card.color_source_kind_combo.findData("obs_column"))
+    _select_card_value(card, spec.display_name)
+    assert card.edit_colors_button.isEnabled()
+
+    emitted: list[ShapesLoadRequest] = []
+    card.edit_colors_requested.connect(emitted.append)
+    card.edit_colors_button.click()
+    assert len(emitted) == 1
+    assert emitted[0].selected_color_source == spec
+
+
+def test_edit_shapes_category_colors_opens_editor_and_restyles_on_apply(qtbot, monkeypatch) -> None:
+    table = _categorical_obs_table()
+    widget = ViewerWidget(DummyViewer())
+    qtbot.addWidget(widget)
+    widget._app_state.sdata = _TableSdata({"table": table})
+
+    restyle_requests: list[ShapesLoadRequest] = []
+    monkeypatch.setattr(widget, "_add_or_update_styled_shapes_layer", restyle_requests.append)
+
+    request = _shapes_obs_color_request()
+    widget._edit_shapes_category_colors(request)
+
+    assert len(widget._open_category_color_editors) == 1
+    editor = widget._open_category_color_editors[0]
+    editor.set_category_color("A", "#ff0000")
+    editor.set_category_color("B", "#00ff00")
+    editor.set_category_color("C", "#0000ff")
+    editor.apply()
+
+    assert list(table.uns["scNiche_colors"]) == ["#ff0000", "#00ff00", "#0000ff"]
+    assert restyle_requests == [request]  # re-styling runs on each apply
+
+
+def test_edit_shapes_category_colors_rejects_non_categorical_column(qtbot) -> None:
+    table = ad.AnnData(obs=pd.DataFrame({"score": [1.0, 2.0]}, index=["a", "b"]))
+    widget = ViewerWidget(DummyViewer())
+    qtbot.addWidget(widget)
+    widget._app_state.sdata = _TableSdata({"table": table})
+
+    widget._edit_shapes_category_colors(_shapes_obs_color_request(value_key="score", value_kind="continuous"))
+
+    assert widget._open_category_color_editors == []
+    _assert_action_feedback_card(widget, title="Edit Colours", kind="error")
+
+
+def test_edit_labels_category_colors_opens_editor_and_restyles_on_apply(qtbot, monkeypatch) -> None:
+    from napari_harpy.widgets.viewer.labels_widget import LabelsLoadRequest
+
+    table = _categorical_obs_table()
+    widget = ViewerWidget(DummyViewer())
+    qtbot.addWidget(widget)
+    widget._app_state.sdata = _TableSdata({"table": table})
+
+    restyle_requests: list[LabelsLoadRequest] = []
+    monkeypatch.setattr(widget, "_add_or_update_styled_labels_layer", restyle_requests.append)
+
+    request = LabelsLoadRequest(
+        labels_name="cells",
+        table_name="table",
+        selected_source_kind="obs_column",
+        selected_color_source=TableColorSourceSpec(
+            table_name="table", source_kind="obs_column", value_key="scNiche", value_kind="categorical"
+        ),
+    )
+    widget._edit_labels_category_colors(request)
+
+    assert len(widget._open_category_color_editors) == 1
+    editor = widget._open_category_color_editors[0]
+    editor.set_category_color("A", "#010203")
+    editor.set_category_color("B", "#040506")
+    editor.set_category_color("C", "#070809")
+    editor.apply()
+
+    assert list(table.uns["scNiche_colors"]) == ["#010203", "#040506", "#070809"]
+    assert restyle_requests == [request]
+
+
+def test_edit_shapes_category_colors_deduplicates_open_editor(qtbot) -> None:
+    table = _categorical_obs_table()
+    widget = ViewerWidget(DummyViewer())
+    qtbot.addWidget(widget)
+    widget._app_state.sdata = _TableSdata({"table": table})
+
+    widget._edit_shapes_category_colors(_shapes_obs_color_request())
+    widget._edit_shapes_category_colors(_shapes_obs_color_request())  # second click, same table/column
+
+    assert len(widget._open_category_color_editors) == 1
+
+
+def test_open_category_color_editors_closed_on_sdata_change(qtbot) -> None:
+    table = _categorical_obs_table()
+    widget = ViewerWidget(DummyViewer())
+    qtbot.addWidget(widget)
+    widget._app_state.sdata = _TableSdata({"table": table})
+
+    widget._edit_shapes_category_colors(_shapes_obs_color_request())
+    assert len(widget._open_category_color_editors) == 1
+
+    widget._on_sdata_changed(None)  # loading different data must dismiss editors bound to the old table
+    assert widget._open_category_color_editors == []
+
+
+def test_shapes_card_layer_combo_populates_for_var_and_attaches_to_source(qtbot) -> None:
+    from napari_harpy.widgets.viewer.shapes_widget import _ShapesCardWidget
+
+    spec = TableColorSourceSpec(table_name="table", source_kind="x_var", value_key="GeneA", value_kind="continuous")
+    card = _ShapesCardWidget(
+        shapes_name="cells",
+        shape_column_color_sources=[],
+        table_color_sources_by_table={"table": [spec]},
+        table_layers_by_table={"table": ["X", "log1p", "raw"]},
+    )
+    qtbot.addWidget(card)
+
+    card.color_source_kind_combo.setCurrentIndex(card.color_source_kind_combo.findData("x_var"))
+    _select_card_value(card, spec.display_name)
+
+    assert _combo_texts(card.layer_combo) == ["X", "log1p", "raw"]
+    assert card.selected_color_source.layer is None  # defaults to X -> None
+
+    card.layer_combo.setCurrentText("log1p")
+    selected = card.selected_color_source
+    assert selected.source_kind == "x_var"
+    assert selected.value_key == "GeneA"
+    assert selected.layer == "log1p"  # the chosen layer rides on the spec sent to styling
+
+
+def test_shapes_card_set_linked_tables_refreshes_layer_choices(qtbot) -> None:
+    from napari_harpy.widgets.viewer.shapes_widget import _ShapesCardWidget
+
+    spec = TableColorSourceSpec(table_name="table", source_kind="x_var", value_key="GeneA", value_kind="continuous")
+    card = _ShapesCardWidget(
+        shapes_name="cells",
+        shape_column_color_sources=[],
+        table_color_sources_by_table={"table": [spec]},
+        table_layers_by_table={"table": ["X"]},
+    )
+    qtbot.addWidget(card)
+    card.color_source_kind_combo.setCurrentIndex(card.color_source_kind_combo.findData("x_var"))
+    card.color_source_value_input.setText("GeneA")
+    assert _combo_texts(card.layer_combo) == ["X"]
+
+    # A mid-session table write delivers new layers via set_linked_tables -> the dropdown must update.
+    card.set_linked_tables({"table": [spec]}, table_layers_by_table={"table": ["X", "log1p", "smoothed"]})
+    assert _combo_texts(card.layer_combo) == ["X", "log1p", "smoothed"]
+
+
+def test_labels_card_layer_combo_populates_for_var_and_attaches_to_source(qtbot) -> None:
+    from napari_harpy.widgets.viewer.labels_widget import _LabelsCardWidget
+
+    spec = TableColorSourceSpec(table_name="table", source_kind="x_var", value_key="GeneA", value_kind="continuous")
+    card = _LabelsCardWidget(
+        labels_name="cells",
+        table_color_sources_by_table={"table": [spec]},
+        table_layers_by_table={"table": ["X", "log1p"]},
+    )
+    qtbot.addWidget(card)
+    card.color_source_kind_combo.setCurrentIndex(card.color_source_kind_combo.findData("x_var"))
+    card.color_source_value_input.setText("GeneA")
+
+    assert _combo_texts(card.layer_combo) == ["X", "log1p"]
+    card.layer_combo.setCurrentText("log1p")
+    assert card.selected_color_source.layer == "log1p"
+
+
+def test_labels_card_builds_smoothed_gene_module_source_and_reports_invalid_gene_lists(qtbot) -> None:
+    from napari_harpy.widgets.viewer.labels_widget import _LabelsCardWidget
+
+    vars_ = [
+        TableColorSourceSpec(table_name="table", source_kind="x_var", value_key=gene, value_kind="continuous")
+        for gene in ("COL1A1", "COL1A2", "COL3A1")
+    ]
+    card = _LabelsCardWidget(
+        labels_name="cells",
+        table_color_sources_by_table={"table": vars_},
+        table_layers_by_table={"table": ["X", "smoothed_k100"]},
+    )
+    qtbot.addWidget(card)
+
+    card.color_source_kind_combo.setCurrentIndex(card.color_source_kind_combo.findData("x_module"))
+    assert card.color_source_value_label.text() == "Genes"
+    assert card.color_source_value_input.text() == ""
+    assert card.color_source_value_input.completer().model().stringList() == []
+
+    card.color_source_value_input.setText("COL1A1, COL1A2; COL3A1")
+    card.layer_combo.setCurrentText("smoothed_k100")
+    # A pre-smoothed matrix is usable even when this linked table has no UMAP.
+    assert card.selected_color_source is None
+    assert "requires X_umap" in card.action_hint_label.text()
+    card.module_smoothing.checkbox.setChecked(False)
+    selected = card.selected_color_source
+    assert selected is not None
+    assert selected.source_kind == "x_module"
+    assert selected.module_genes == ("COL1A1", "COL1A2", "COL3A1")
+    assert selected.value_key == "COL1A1 + COL1A2 + COL3A1"
+    assert selected.layer == "smoothed_k100"
+    assert "mean z-score of 3 genes" in card.action_hint_label.text()
+    assert "smoothed_k100" in card.action_hint_label.text()
+
+    card.color_source_value_input.setText("COL1A1, COL1A1")
+    assert card.selected_color_source is None
+    assert "duplicate module genes" in card.action_hint_label.text()
+
+    card.color_source_value_input.setText("COL1A1, NOT_A_GENE")
+    assert card.selected_color_source is None
+    assert "not found in the selected table" in card.action_hint_label.text()
+
+
+def test_shapes_card_builds_gene_module_source_with_umap_smoothing(qtbot) -> None:
+    from napari_harpy.widgets.viewer.shapes_widget import _ShapesCardWidget
+
+    vars_ = [
+        TableColorSourceSpec(table_name="table", source_kind="x_var", value_key=gene, value_kind="continuous")
+        for gene in ("GeneA", "GeneB")
+    ]
+    card = _ShapesCardWidget(
+        shapes_name="cells",
+        shape_column_color_sources=[],
+        table_color_sources_by_table={"table": vars_},
+        table_layers_by_table={"table": ["X", "log1p"]},
+        table_smoothers_by_table={"table": ["smoother_k100"]},
+        table_umap_by_table={"table": True},
+    )
+    qtbot.addWidget(card)
+
+    card.color_source_kind_combo.setCurrentIndex(card.color_source_kind_combo.findData("x_module"))
+    card.color_source_value_input.setText("GeneA GeneB")
+    card.layer_combo.setCurrentText("log1p")
+    card.smooth_checkbox.setChecked(True)
+    assert card.module_smoothing.checkbox.isChecked()
+    assert card.module_smoothing.neighbors_spinbox.value() == 100
+    card.module_smoothing.neighbors_spinbox.setValue(25)
+
+    selected = card.selected_color_source
+    assert selected is not None
+    assert selected.source_kind == "x_module"
+    assert selected.module_genes == ("GeneA", "GeneB")
+    assert selected.layer == "log1p"
+    assert selected.smoother is None  # Arbitrary existing obsp graphs do not establish UMAP provenance.
+    assert selected.umap_neighbors == 25
+    assert "mean z-score of 2 genes" in card.action_hint_label.text()
+    assert "UMAP smoothing (k=25" in card.action_hint_label.text()
+
+    card.set_linked_tables(
+        {"table": vars_},
+        table_layers_by_table={"table": ["X", "log1p"]},
+        table_umap_by_table={"table": True},
+    )
+    assert card.selected_color_source == selected
+    card.color_source_kind_combo.setCurrentIndex(card.color_source_kind_combo.findData("x_var"))
+    card.color_source_kind_combo.setCurrentIndex(card.color_source_kind_combo.findData("x_module"))
+    assert card.selected_color_source == selected
+
+
+def test_viewer_widget_module_discovers_umap_and_dispatches_scores(qtbot, sdata_blobs) -> None:
+    table = sdata_blobs.tables["table"]
+    table.obsm["X_umap"] = np.column_stack([np.arange(table.n_obs, dtype=float), np.zeros(table.n_obs)])
+    viewer = DummyViewer()
+    widget = ViewerWidget(viewer)
+    qtbot.addWidget(widget)
+    widget.app_state.set_sdata(sdata_blobs)
+    card = widget.labels_cards[0]
+    card.color_source_kind_combo.setCurrentIndex(card.color_source_kind_combo.findData("x_module"))
+    card.color_source_value_input.setText(", ".join(table.var_names[:2]))
+    card.module_smoothing.neighbors_spinbox.setValue(2)
+
+    assert card.selected_color_source.umap_neighbors == 2
+    card.add_update_button.click()
+
+    assert len(viewer.layers) == 1
+    assert "~UMAP-k2:module:" in viewer.layers[0].name
+    assert card.selected_color_source.value_key in viewer.layers[0].features
+
+
+def test_umap_discovery_accepts_partial_embedding_but_rejects_all_missing(sdata_blobs) -> None:
+    table = sdata_blobs.tables["table"]
+    table.obsm["X_umap"] = np.full((table.n_obs, 2), np.nan)
+    assert viewer_widget_module._table_umap_available(sdata_blobs, ["table"]) == {"table": False}
+    table.obsm["X_umap"][0] = [0.0, 1.0]
+    assert viewer_widget_module._table_umap_available(sdata_blobs, ["table"]) == {"table": True}
+
+
+def test_shapes_card_uses_dropdown_for_observations_and_line_edit_for_vars(qtbot) -> None:
+    from napari_harpy.widgets.viewer.shapes_widget import _ShapesCardWidget
+
+    obs = TableColorSourceSpec(table_name="t", source_kind="obs_column", value_key="scNiche", value_kind="categorical")
+    obs2 = TableColorSourceSpec(
+        table_name="t", source_kind="obs_column", value_key="celltype", value_kind="categorical"
+    )
+    var = TableColorSourceSpec(table_name="t", source_kind="x_var", value_key="GeneA", value_kind="continuous")
+    card = _ShapesCardWidget(
+        shapes_name="cells",
+        shape_column_color_sources=[],
+        table_color_sources_by_table={"t": [obs, obs2, var]},
+    )
+    qtbot.addWidget(card)
+
+    # Observations -> scrollable dropdown listing the obs columns.
+    card.color_source_kind_combo.setCurrentIndex(card.color_source_kind_combo.findData("obs_column"))
+    assert card.color_source_value_stack.currentWidget() is card.color_source_value_combo
+    assert _combo_texts(card.color_source_value_combo) == ["scNiche", "celltype"]
+    card.color_source_value_combo.setCurrentText("celltype")
+    assert card.selected_color_source.value_key == "celltype"
+
+    # Vars -> type-to-filter line edit (the gene list can be huge).
+    card.color_source_kind_combo.setCurrentIndex(card.color_source_kind_combo.findData("x_var"))
+    assert card.color_source_value_stack.currentWidget() is card.color_source_value_input
+    card.color_source_value_input.setText("GeneA")
+    assert card.selected_color_source.value_key == "GeneA"
+
+
+def test_shapes_card_smooth_checkbox_attaches_smoother_for_var(qtbot) -> None:
+    from napari_harpy.widgets.viewer.shapes_widget import _ShapesCardWidget
+
+    var = TableColorSourceSpec(table_name="t", source_kind="x_var", value_key="GeneA", value_kind="continuous")
+    card = _ShapesCardWidget(
+        shapes_name="cells",
+        shape_column_color_sources=[],
+        table_color_sources_by_table={"t": [var]},
+        table_smoothers_by_table={"t": ["smoother_k100"]},
+    )
+    qtbot.addWidget(card)
+    card.color_source_kind_combo.setCurrentIndex(card.color_source_kind_combo.findData("x_var"))
+    card.color_source_value_input.setText("GeneA")
+
+    assert card.selected_color_source.smoother is None  # smoothing off by default
+    card.smooth_checkbox.setChecked(True)
+    assert card.selected_color_source.smoother == "smoother_k100"  # toggled on -> rides on the spec
+    assert card.selected_color_source.value_key == "GeneA"
+
+
+def test_shapes_card_smoother_cleared_switching_to_table_without_smoother(qtbot) -> None:
+    from napari_harpy.widgets.viewer.shapes_widget import _ShapesCardWidget
+
+    var_a = TableColorSourceSpec(table_name="ta", source_kind="x_var", value_key="GeneA", value_kind="continuous")
+    var_b = TableColorSourceSpec(table_name="tb", source_kind="x_var", value_key="GeneA", value_kind="continuous")
+    card = _ShapesCardWidget(
+        shapes_name="cells",
+        shape_column_color_sources=[],
+        table_color_sources_by_table={"ta": [var_a], "tb": [var_b]},
+        table_smoothers_by_table={"ta": ["smoother_k100"], "tb": []},
+    )
+    qtbot.addWidget(card)
+    card.color_source_kind_combo.setCurrentIndex(card.color_source_kind_combo.findData("x_var"))
+    card.color_source_value_input.setText("GeneA")
+    card.smooth_checkbox.setChecked(True)
+    assert card.selected_color_source.smoother == "smoother_k100"
+
+    # Switch to a table with no smoother: the still-checked box can't apply a kernel that table lacks.
+    card.linked_table_combo.setCurrentText("tb")
+    card.color_source_value_input.setText("GeneA")
+    assert card.selected_color_source.smoother is None
+
+
+def test_labels_card_smooth_checkbox_attaches_smoother_for_var(qtbot) -> None:
+    from napari_harpy.widgets.viewer.labels_widget import _LabelsCardWidget
+
+    var = TableColorSourceSpec(table_name="t", source_kind="x_var", value_key="GeneA", value_kind="continuous")
+    card = _LabelsCardWidget(
+        labels_name="cells",
+        table_color_sources_by_table={"t": [var]},
+        table_smoothers_by_table={"t": ["smoother_k100"]},
+    )
+    qtbot.addWidget(card)
+    card.color_source_kind_combo.setCurrentIndex(card.color_source_kind_combo.findData("x_var"))
+    card.color_source_value_input.setText("GeneA")
+
+    assert card.selected_color_source.smoother is None
+    card.smooth_checkbox.setChecked(True)
+    assert card.selected_color_source.smoother == "smoother_k100"

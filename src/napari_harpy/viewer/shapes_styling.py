@@ -26,9 +26,11 @@ from napari_harpy.viewer._styling import (
     continuous_rgba_for_values,
     default_categorical_palette_for_categories,
     is_string_like_series,
+    module_score_values,
     normalize_category_value,
     resolve_table_categorical_palette,
     validate_styled_palette_source,
+    var_expression_values,
 )
 
 if TYPE_CHECKING:
@@ -176,7 +178,9 @@ def apply_shape_column_color_source_to_shapes_layer(
             rendered_row_values=rendered_row_values,
         )
     else:
-        style_result, rendered_row_colors, feature_values = _build_continuous_shape_style(rendered_row_values)
+        style_result, rendered_row_colors, feature_values = _build_continuous_shape_style(
+            rendered_row_values, colormap=style_spec.colormap
+        )
 
     if isinstance(layer, Shapes):
         _apply_rendered_row_colors_to_shapes_layer(layer, rendered_row_colors, fill=fill)
@@ -195,6 +199,60 @@ def apply_shape_column_color_source_to_shapes_layer(
         source_shapes_index_feature_name=source_shapes_index_feature_name,
     )
     return style_result
+
+
+def source_row_hidden_mask(
+    sdata: SpatialData,
+    shapes_name: str,
+    style_spec: TableColorSourceSpec,
+) -> np.ndarray | None:
+    """Return source rows that must not be drawn in a categorical styled overlay.
+
+    For an ``obs_column`` that renders categorically, the mask includes both categories hidden via
+    an alpha-0 palette entry and source rows whose aligned category is missing. Missing categories
+    otherwise render with :data:`SHAPES_MISSING_BASE_COLOR`, leaving grey cells behind after every
+    real category is hidden. Returns ``None`` when no source row needs masking (or the source has no
+    categorical hiding/missing-value concept), so callers can skip geometry filtering.
+    """
+    from napari_harpy.viewer.category_colors import hidden_categories
+
+    if style_spec.source_kind != "obs_column":
+        return None
+    table = get_table(sdata, style_spec.table_name)
+    if style_spec.value_key not in table.obs:
+        return None
+    hidden = hidden_categories(table, style_spec.value_key)
+    renders_categorical = _obs_column_renders_categorical(table.obs[style_spec.value_key])
+    if not hidden and not renders_categorical:
+        return None
+
+    shapes = getattr(sdata, "shapes", {})
+    if shapes_name not in shapes:
+        return None
+    shapes_element = shapes[shapes_name]
+    table_metadata = get_table_metadata(sdata, style_spec.table_name)
+    if style_spec.value_key == table_metadata.instance_key:
+        return None
+    # source_row_values is independent of the rendered-row mapping, so a 1:1 placeholder is fine.
+    alignment = _align_table_color_source_to_shapes_rows(
+        table=table,
+        table_metadata=table_metadata,
+        shapes_name=shapes_name,
+        shapes_element=shapes_element,
+        style_spec=style_spec,
+        source_row_id_by_rendered_row=range(len(shapes_element)),
+    )
+    missing = alignment.source_row_values.isna().to_numpy(dtype=bool)
+    masked = missing.copy() if renders_categorical else np.zeros(len(missing), dtype=bool)
+    if hidden:
+        masked |= np.array(
+            [
+                not is_missing and normalize_category_value(value) in hidden
+                for value, is_missing in zip(alignment.source_row_values, missing, strict=True)
+            ],
+            dtype=bool,
+        )
+    return masked if masked.any() else None
 
 
 def apply_table_color_source_to_shapes_layer(
@@ -273,10 +331,11 @@ def apply_table_color_source_to_shapes_layer(
             table=table,
             aligned_values=aligned_values,
             column_name=style_spec.value_key,
+            colormap=style_spec.colormap,
         )
-    elif style_spec.source_kind == "x_var":
+    elif style_spec.source_kind in {"x_var", "x_module"}:
         style_result, rendered_row_colors, feature_values = _build_continuous_shape_style(
-            aligned_values.rendered_row_values
+            aligned_values.rendered_row_values, colormap=style_spec.colormap
         )
     else:
         raise ValueError(f"Unsupported table color source kind `{style_spec.source_kind}`.")
@@ -320,7 +379,16 @@ def build_styled_shapes_layer_name(
     if style_spec.source_kind == "obs_column":
         return f"{shapes_name}[obs:{style_spec.value_key}]"
     if style_spec.source_kind == "x_var":
-        return f"{shapes_name}[X:{style_spec.value_key}]"
+        layer = getattr(style_spec, "layer", None) or "X"
+        smoother = getattr(style_spec, "smoother", None)
+        layer_label = f"{layer}~{smoother}" if smoother else layer
+        return f"{shapes_name}[{layer_label}:{style_spec.value_key}]"
+    if style_spec.source_kind == "x_module":
+        layer = style_spec.layer or "X"
+        layer_label = f"{layer}~{style_spec.smoother}" if style_spec.smoother else layer
+        if style_spec.umap_neighbors is not None:
+            layer_label = f"{layer}~UMAP-k{style_spec.umap_neighbors}"
+        return f"{shapes_name}[{layer_label}:module:{style_spec.value_key}]"
     return f"{shapes_name}[shapes_column:{style_spec.value_key}]"
 
 
@@ -491,14 +559,21 @@ def _get_shape_instance_values(
     """Return source-row-aligned shape instance identities for table lookup.
 
     Table-backed shapes styling uses the GeoDataFrame index as the shape
-    instance identity. A same-named GeoDataFrame column is allowed only when it
-    duplicates the index values exactly.
+    instance identity. The index may be unnamed or named ``instance_key``:
+    SpatialData's table-to-element join matches on index *values*, and readers
+    such as ``spatialdata-io`` / ``sopa`` leave the shapes index unnamed even
+    though its values already are the instance identities. Only an index that is
+    explicitly named something *other* than ``instance_key`` is rejected, since
+    that signals a different identifier. A same-named GeoDataFrame column is
+    allowed only when it duplicates the index values exactly.
     """
-    if getattr(shapes_element.index, "name", None) != instance_key:
+    index_name = getattr(shapes_element.index, "name", None)
+    if index_name is not None and index_name != instance_key:
         raise ValueError(
-            f"Shapes element `{shapes_name}` must use GeoDataFrame index `{instance_key}` for table-backed styling. "
-            f"Set `sdata.shapes[{shapes_name!r}].index.name = {instance_key!r}` and store the shape instance "
-            "identities in that index before styling from a linked table."
+            f"Shapes element `{shapes_name}` has GeoDataFrame index name `{index_name}`, which does not match the "
+            f"linked table instance key `{instance_key}`. Table-backed styling uses the GeoDataFrame index as the "
+            f"shape instance identity; rename it with `sdata.shapes[{shapes_name!r}].index.name = {instance_key!r}` "
+            "(or leave it unnamed) so the index holds the instance identities expected by the linked table."
         )
 
     index_values = pd.Series(
@@ -552,24 +627,23 @@ def _get_table_color_values_by_instance(
             raise ValueError(f"Observation column `{style_spec.value_key}` is not available in the selected table.")
         values = region_rows[style_spec.value_key]
     elif style_spec.source_kind == "x_var":
-        var_name = style_spec.value_key
-        if var_name not in table.var_names:
-            raise ValueError(f"Var `{var_name}` is not available in the selected table.")
-
-        var_index = table.var_names.get_loc(var_name)
-        if not isinstance(var_index, (int, np.integer)):
-            raise ValueError(f"Var `{var_name}` does not resolve to one unique column in `table.var_names`.")
-
-        obs_positions = table.obs.index.get_indexer(region_rows.index)
-        if np.any(obs_positions < 0):
-            raise ValueError(f"Could not align linked table rows back to `X[:, {var_name!r}]` for viewer coloring.")
-
-        column_values = table.X[obs_positions, int(var_index)]
-        if hasattr(column_values, "toarray"):
-            x_values = column_values.toarray().reshape(-1)
-        else:
-            x_values = np.asarray(column_values).reshape(-1)
-        values = pd.Series(x_values, index=region_rows.index, name=var_name)
+        x_values = var_expression_values(
+            table,
+            var_name=style_spec.value_key,
+            obs_positions=table.obs.index.get_indexer(region_rows.index),
+            layer=style_spec.layer,
+            smoother_key=style_spec.smoother,
+        )
+        values = pd.Series(x_values, index=region_rows.index, name=style_spec.value_key)
+    elif style_spec.source_kind == "x_module":
+        module_values = module_score_values(
+            table,
+            var_names=style_spec.module_genes,
+            umap_neighbors=style_spec.umap_neighbors,
+            obs_positions=table.obs.index.get_indexer(region_rows.index),
+            layer=style_spec.layer,
+        )
+        values = pd.Series(module_values, index=region_rows.index, name=style_spec.value_key)
     else:
         raise ValueError(f"Unsupported table color source kind `{style_spec.source_kind}`.")
 
@@ -736,11 +810,14 @@ def _build_categorical_shape_style(
 
 def _build_continuous_shape_style(
     rendered_row_values: pd.Series,
+    *,
+    colormap: str | None = None,
 ) -> tuple[ShapesStyleResult, np.ndarray, pd.Series]:
     numeric_rendered_row_values = pd.to_numeric(rendered_row_values, errors="coerce").astype("float64")
     rendered_row_colors = continuous_rgba_for_values(
         numeric_rendered_row_values,
         missing_color=SHAPES_MISSING_BASE_COLOR,
+        colormap_name=colormap,
     )
     return (
         ShapesStyleResult(
@@ -753,11 +830,27 @@ def _build_continuous_shape_style(
     )
 
 
+def _obs_column_renders_categorical(full_series: pd.Series) -> bool:
+    """Whether an obs column takes the categorical shapes-rendering branch.
+
+    Keep this predicate in lockstep with :func:`_build_table_obs_shape_style`. In particular, use
+    the live dtype rather than ``TableColorSourceSpec.value_kind`` because persisted specs can
+    disagree with the renderer's bool/binary-integer/string coercion rules.
+    """
+    return bool(
+        _is_categorical_dtype(full_series)
+        or _is_bool_series(full_series)
+        or _is_exact_binary_integer_series(full_series)
+        or is_string_like_series(full_series)
+    )
+
+
 def _build_table_obs_shape_style(
     *,
     table: AnnData,
     aligned_values: _ShapeTableRowAlignment,
     column_name: str,
+    colormap: str | None = None,
 ) -> tuple[ShapesStyleResult, np.ndarray, pd.Series]:
     if column_name not in table.obs:
         raise ValueError(f"Observation column `{column_name}` is not available in the selected table.")
@@ -858,7 +951,7 @@ def _build_table_obs_shape_style(
         )
         return style_result, rendered_row_colors, string_rendered_row_values
 
-    return _build_continuous_shape_style(rendered_row_values)
+    return _build_continuous_shape_style(rendered_row_values, colormap=colormap)
 
 
 def _build_table_instance_shape_style(
@@ -1087,7 +1180,12 @@ def _copy_rgba_with_alpha(colors: np.ndarray, alpha: float, *, row_count: int, r
     if rgba.shape != (row_count, 4):
         raise ValueError(f"Rendered-row colors must contain one RGBA color for each rendered napari {row_kind} row.")
     rgba = rgba.copy()
+    # Preserve fully-transparent rows: a category hidden via an alpha-0 palette entry stays hidden
+    # rather than being forced back to the styled edge/face alpha. (No effect on existing opaque
+    # palettes, where every rendered colour has alpha > 0.)
+    hidden_rows = rgba[:, 3] <= 0.0
     rgba[:, 3] = alpha
+    rgba[hidden_rows, 3] = 0.0
     return rgba
 
 

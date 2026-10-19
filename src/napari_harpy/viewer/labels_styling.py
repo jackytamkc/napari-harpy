@@ -21,9 +21,11 @@ from napari_harpy.viewer._styling import (
     continuous_rgba_for_values,
     default_categorical_palette_for_categories,
     is_string_like_series,
+    module_score_values,
     normalize_category_value,
     resolve_table_categorical_palette,
     validate_styled_palette_source,
+    var_expression_values,
 )
 
 if TYPE_CHECKING:
@@ -80,16 +82,34 @@ def apply_table_color_source_to_labels_layer(
             table=table,
             region_rows=region_rows,
             column_name=style_spec.value_key,
+            colormap=style_spec.colormap,
         )
         _apply_labels_colormap(layer, color_dict)
-    else:
+    elif style_spec.source_kind == "x_var":
         style_result, color_dict, features = _build_x_var_colormap(
             table=table,
             region_rows=region_rows,
             obs_index=obs_index,
             var_name=style_spec.value_key,
+            layer=style_spec.layer,
+            smoother=style_spec.smoother,
+            colormap=style_spec.colormap,
         )
         _apply_labels_colormap(layer, color_dict)
+    elif style_spec.source_kind == "x_module":
+        style_result, color_dict, features = _build_x_module_colormap(
+            table=table,
+            region_rows=region_rows,
+            obs_index=obs_index,
+            module_genes=style_spec.module_genes,
+            feature_name=style_spec.value_key,
+            umap_neighbors=style_spec.umap_neighbors,
+            layer=style_spec.layer,
+            colormap=style_spec.colormap,
+        )
+        _apply_labels_colormap(layer, color_dict)
+    else:  # pragma: no cover - TableColorSourceSpec validates this first.
+        raise ValueError(f"Unsupported table color source kind `{style_spec.source_kind}`.")
 
     layer.features = _build_labels_features(features, instance_key=table_metadata.instance_key)
     return style_result
@@ -99,7 +119,72 @@ def build_styled_labels_layer_name(labels_name: str, style_spec: TableColorSourc
     """Return the user-facing layer name for one styled labels variant."""
     if style_spec.source_kind == "obs_column":
         return f"{labels_name}[obs:{style_spec.value_key}]"
-    return f"{labels_name}[X:{style_spec.value_key}]"
+    layer = style_spec.layer or "X"
+    layer_label = f"{layer}~{style_spec.smoother}" if style_spec.smoother else layer
+    if style_spec.source_kind == "x_module":
+        if style_spec.umap_neighbors is not None:
+            layer_label = f"{layer}~UMAP-k{style_spec.umap_neighbors}"
+        return f"{labels_name}[{layer_label}:module:{style_spec.value_key}]"
+    return f"{labels_name}[{layer_label}:{style_spec.value_key}]"
+
+
+def _obs_column_renders_categorical(full_series: pd.Series) -> bool:
+    """Whether an obs column renders CATEGORICALLY in the labels colormap (so its NaN cells get the flat
+    grey missing colour, and hidden categories are meaningful).
+
+    Mirrors the branch selection in :func:`_build_obs_column_colormap` EXACTLY -- keep the two in sync.
+    We derive the mask's categoricity from the render path here rather than trusting
+    ``style_spec.value_kind``: that is set by a slightly different classifier (and persisted verbatim in
+    presets), so it can disagree with the live column dtype -- e.g. an all-0/all-1 nullable-int column is
+    ``value_kind="continuous"`` but the renderer paints it categorically, greying its NaN cells.
+    """
+    return bool(
+        _is_categorical_dtype(full_series)
+        or pd.api.types.is_bool_dtype(full_series)
+        or (
+            pd.api.types.is_integer_dtype(full_series)
+            and _has_exact_binary_zero_one_values(full_series.dropna().tolist())
+        )
+        or is_string_like_series(full_series)
+    )
+
+
+def masked_label_ids(sdata: SpatialData, labels_name: str, style_spec: TableColorSourceSpec) -> frozenset[int]:
+    """Label IDs to drop to background in a styled-labels DISPLAY.
+
+    Cells whose category is HIDDEN (alpha-0 palette entry) PLUS -- for a column that renders
+    *categorically* -- cells that are UNASSIGNED (NaN category), which otherwise show the flat grey
+    ``MISSING_CATEGORICAL_COLOR``. Both are "not a visible cell type", so hiding every type yields a clean
+    overlay. The caller maps these IDs to background (0) in the *displayed* raster -- the only way to hide
+    labels under napari's opaque blending, which ignores the colormap alpha. Display-only: the element /
+    on-disk zarr is never touched. ``obs_column`` sources only; empty otherwise.
+    """
+    from napari_harpy.viewer.category_colors import hidden_categories
+
+    if not isinstance(style_spec, TableColorSourceSpec) or style_spec.source_kind != "obs_column":
+        return frozenset()
+    table = get_table(sdata, style_spec.table_name)
+    if style_spec.value_key not in getattr(table, "obs", {}):
+        return frozenset()
+    hidden = hidden_categories(table, style_spec.value_key)
+    is_categorical = _obs_column_renders_categorical(table.obs[style_spec.value_key])
+    if not hidden and not is_categorical:
+        return frozenset()  # nothing hidden and no "unassigned" concept -> skip the obs scan
+    table_metadata = validate_table_binding(sdata, labels_name, style_spec.table_name)
+    if style_spec.value_key == table_metadata.instance_key:  # instance-id colouring has no categories
+        return frozenset()
+    region_rows, _ = _get_region_rows_by_instance(table, table_metadata, labels_name)
+    if style_spec.value_key not in region_rows.columns:
+        return frozenset()
+    values = region_rows[style_spec.value_key]
+    na = values.isna().to_numpy(dtype=bool)  # vectorized; runs on every categorical restyle
+    masked = na.copy() if is_categorical else np.zeros(len(values), dtype=bool)  # unassigned cells
+    if hidden:  # per-cell normalize only when a category is actually hidden
+        masked |= np.array(
+            [not is_na and normalize_category_value(value) in hidden for value, is_na in zip(values, na, strict=True)],
+            dtype=bool,
+        )
+    return frozenset(int(instance_id) for instance_id in region_rows.index[masked])
 
 
 def _build_obs_column_colormap(
@@ -107,6 +192,7 @@ def _build_obs_column_colormap(
     table: AnnData,
     region_rows: pd.DataFrame,
     column_name: str,
+    colormap: str | None = None,
 ) -> tuple[LabelsStyleResult, dict[int, Any], pd.DataFrame]:
     if column_name not in table.obs:
         raise ValueError(f"Observation column `{column_name}` is not available in the selected table.")
@@ -187,7 +273,7 @@ def _build_obs_column_colormap(
         return style_result, color_dict, pd.DataFrame({column_name: string_region_values}, index=region_rows.index)
 
     numeric_region_series = pd.to_numeric(region_series, errors="coerce").astype("float64")
-    color_dict = _build_continuous_color_dict(numeric_region_series)
+    color_dict = _build_continuous_color_dict(numeric_region_series, colormap=colormap)
     style_result = LabelsStyleResult(
         value_kind="continuous",
         palette_source=None,
@@ -220,35 +306,62 @@ def _build_x_var_colormap(
     region_rows: pd.DataFrame,
     obs_index: pd.Index,
     var_name: str,
+    layer: str | None = None,
+    smoother: str | None = None,
+    colormap: str | None = None,
 ) -> tuple[LabelsStyleResult, dict[int, Any], pd.DataFrame]:
-    if var_name not in table.var_names:
-        raise ValueError(f"Var `{var_name}` is not available in the selected table.")
-
-    var_index = table.var_names.get_loc(var_name)
-    if not isinstance(var_index, (int, np.integer)):
-        raise ValueError(f"Var `{var_name}` does not resolve to one unique column in `table.var_names`.")
-
-    obs_positions = table.obs.index.get_indexer(obs_index)
-    if np.any(obs_positions < 0):
-        raise ValueError(f"Could not align linked table rows back to `X[:, {var_name!r}]` for viewer coloring.")
-
-    column_values = table.X[obs_positions, int(var_index)]
-    if hasattr(column_values, "toarray"):
-        numeric_values = column_values.toarray().reshape(-1)
-    else:
-        numeric_values = np.asarray(column_values).reshape(-1)
+    numeric_values = var_expression_values(
+        table,
+        var_name=var_name,
+        obs_positions=table.obs.index.get_indexer(obs_index),
+        layer=layer,
+        smoother_key=smoother,
+    )
     numeric_region_series = pd.Series(
         pd.to_numeric(numeric_values, errors="coerce").astype("float64"),
         index=region_rows.index,
         name=var_name,
     )
-    color_dict = _build_continuous_color_dict(numeric_region_series)
+    color_dict = _build_continuous_color_dict(numeric_region_series, colormap=colormap)
     style_result = LabelsStyleResult(
         value_kind="continuous",
         palette_source=None,
         coercion_applied=False,
     )
     return style_result, color_dict, pd.DataFrame({var_name: numeric_region_series}, index=region_rows.index)
+
+
+def _build_x_module_colormap(
+    *,
+    table: AnnData,
+    region_rows: pd.DataFrame,
+    obs_index: pd.Index,
+    module_genes: tuple[str, ...],
+    feature_name: str,
+    umap_neighbors: int | None = None,
+    layer: str | None = None,
+    colormap: str | None = None,
+) -> tuple[LabelsStyleResult, dict[int, Any], pd.DataFrame]:
+    numeric_values = module_score_values(
+        table,
+        var_names=module_genes,
+        umap_neighbors=umap_neighbors,
+        obs_positions=table.obs.index.get_indexer(obs_index),
+        layer=layer,
+    )
+    numeric_region_series = pd.Series(
+        numeric_values,
+        index=region_rows.index,
+        name=feature_name,
+        dtype="float64",
+    )
+    color_dict = _build_continuous_color_dict(numeric_region_series, colormap=colormap)
+    style_result = LabelsStyleResult(
+        value_kind="continuous",
+        palette_source=None,
+        coercion_applied=False,
+    )
+    return style_result, color_dict, pd.DataFrame({feature_name: numeric_region_series}, index=region_rows.index)
 
 
 def _get_region_rows_by_instance(
@@ -308,9 +421,9 @@ def _build_categorical_color_dict(
     return color_dict
 
 
-def _build_continuous_color_dict(values: pd.Series) -> dict[int | None, Any]:
+def _build_continuous_color_dict(values: pd.Series, *, colormap: str | None = None) -> dict[int | None, Any]:
     color_dict: dict[int | None, Any] = {None: "transparent", 0: "transparent"}
-    colors = continuous_rgba_for_values(values)
+    colors = continuous_rgba_for_values(values, colormap_name=colormap)
     for instance_id, color in zip(values.index, colors, strict=True):
         color_dict[int(instance_id)] = color
     return color_dict

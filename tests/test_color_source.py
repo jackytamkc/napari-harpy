@@ -5,6 +5,9 @@ import pytest
 from napari_harpy.core._color_source import (
     ShapeColumnColorSourceSpec,
     TableColorSourceSpec,
+    gene_module_value_key,
+    parse_gene_module_text,
+    validate_gene_module_genes,
 )
 from napari_harpy.viewer.labels_styling import LabelsStyleResult
 from napari_harpy.viewer.shapes_styling import ShapesStyleResult
@@ -27,6 +30,72 @@ def test_table_color_source_spec_rejects_invalid_value_kind() -> None:
             source_kind="obs_column",
             value_key="cell_type",
             value_kind="ordinal",
+        )
+
+
+def test_gene_module_helpers_parse_validate_and_label_genes() -> None:
+    genes = parse_gene_module_text("COL1A1, COL1A2;\nCOL3A1")
+
+    assert genes == ("COL1A1", "COL1A2", "COL3A1")
+    assert validate_gene_module_genes(genes, available_var_names=("COL1A1", "COL1A2", "COL3A1")) == genes
+    assert gene_module_value_key(genes) == "COL1A1 + COL1A2 + COL3A1"
+
+
+def test_gene_module_validation_rejects_too_few_duplicate_and_missing_genes() -> None:
+    with pytest.raises(ValueError, match="at least two genes"):
+        validate_gene_module_genes(("COL1A1",))
+    with pytest.raises(ValueError, match="duplicate module genes: COL1A1"):
+        validate_gene_module_genes(("COL1A1", "COL1A1"))
+    with pytest.raises(ValueError, match="not found in the selected table: COL3A1"):
+        validate_gene_module_genes(("COL1A1", "COL3A1"), available_var_names=("COL1A1", "COL1A2"))
+
+
+def test_table_gene_module_spec_requires_continuous_score_and_two_unique_genes() -> None:
+    spec = TableColorSourceSpec(
+        table_name="table",
+        source_kind="x_module",
+        value_key="COL1A1 + COL1A2",
+        value_kind="continuous",
+        module_genes=["COL1A1", "COL1A2"],
+    )
+    assert spec.module_genes == ("COL1A1", "COL1A2")
+
+    with pytest.raises(ValueError, match="value_kind='continuous'"):
+        TableColorSourceSpec(
+            table_name="table",
+            source_kind="x_module",
+            value_key="COL1A1 + COL1A2",
+            value_kind="categorical",
+            module_genes=("COL1A1", "COL1A2"),
+        )
+    with pytest.raises(ValueError, match="at least two genes"):
+        TableColorSourceSpec(
+            table_name="table",
+            source_kind="x_module",
+            value_key="COL1A1",
+            value_kind="continuous",
+            module_genes=("COL1A1",),
+        )
+
+
+def test_module_spec_canonicalizes_gene_label_and_rejects_unverified_smoother() -> None:
+    spec = TableColorSourceSpec(
+        table_name="t",
+        source_kind="x_module",
+        value_key="Wrong genes",
+        value_kind="continuous",
+        module_genes=("A", "B"),
+        umap_neighbors=25,
+    )
+    assert spec.value_key == "A + B"
+    with pytest.raises(ValueError, match="`smoother` is unsupported"):
+        TableColorSourceSpec(
+            table_name="t",
+            source_kind="x_module",
+            value_key="A + B",
+            value_kind="continuous",
+            module_genes=("A", "B"),
+            smoother="smoother_spatial",
         )
 
 

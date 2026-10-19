@@ -4,10 +4,14 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, Literal, TypeAlias
 
 import napari
+from loguru import logger
 
 from napari_harpy._app_state import HarpyAppState, get_or_create_app_state
+from napari_harpy.viewer.viewer_config import ViewerConfigManager
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from spatialdata import SpatialData
 
 HarpyWidgetId: TypeAlias = Literal["viewer", "feature_extraction", "object_classification", "shapes_annotation"]
@@ -38,6 +42,20 @@ class Interactive:
         If ``True`` or ``False``, explicitly enable or disable napari's
         experimental async slicing for this session. If ``None``, leave napari's
         current setting unchanged.
+    autoload
+        If ``True`` (the default), apply the saved viewer preset whose image
+        channel panel matches ``sdata`` right after the widgets are docked, so a
+        sample re-opens with the display you last saved. See
+        :meth:`save_config` and :mod:`napari_harpy.viewer.viewer_config`.
+
+    Notes
+    -----
+    Viewer presets capture how a sample is displayed (image channel colormaps and
+    contrast, layer styling, category palettes, scale bar, coordinate system and
+    camera) and restore it for the same sample -- or any sample sharing the same
+    channel panel -- without re-tuning by hand. Press ``Shift-S`` to save the
+    current display and ``Shift-D`` to re-apply it, or use :meth:`save_config` /
+    :meth:`load_config` programmatically.
     """
 
     _PLUGIN_NAME = "napari-harpy"
@@ -61,6 +79,7 @@ class Interactive:
         headless: bool = False,
         widgets: HarpyWidgetSelection = "all",
         async_slicing: bool | None = False,
+        autoload: bool = True,
     ) -> None:
         widget_ids = self._normalize_widget_selection(widgets)
         if async_slicing is not None:
@@ -68,9 +87,17 @@ class Interactive:
         self._viewer = viewer or napari.current_viewer() or napari.Viewer()
         self._app_state = get_or_create_app_state(self._viewer)
         self._dock_widgets: dict[str, tuple[Any, Any]] = {}
+        self._config_manager = ViewerConfigManager(self._app_state)
+        self._config_manager.bind_keys()
 
         self._app_state.set_sdata(sdata)
         self._ensure_harpy_widgets(widget_ids)
+
+        if autoload:
+            try:
+                self._config_manager.autoload()
+            except Exception:  # noqa: BLE001  # pragma: no cover - never block startup on a bad preset
+                logger.exception("Failed to auto-load viewer preset")
 
         if not headless:
             self.run()
@@ -84,6 +111,46 @@ class Interactive:
     def app_state(self) -> HarpyAppState:
         """Return the shared Harpy app state for the active viewer."""
         return self._app_state
+
+    def save_config(self, name: str | None = None) -> Path | None:
+        """Save the current viewer display as a preset (same as pressing ``Shift-S``).
+
+        Parameters
+        ----------
+        name
+            Optional preset name. When omitted, a deterministic name derived from
+            the image channel panel is used, so re-saving the same panel
+            overwrites the existing preset rather than creating a duplicate.
+
+        Returns
+        -------
+        Path | None
+            The path the preset was written to, or ``None`` when there were no
+            harpy-managed layers in the viewer to save.
+        """
+        return self._config_manager.save(name)
+
+    def load_config(self, name: str | None = None) -> bool:
+        """Apply a saved viewer preset (same as pressing ``Shift-D``).
+
+        Parameters
+        ----------
+        name
+            Preset name to apply. When omitted, the preset whose channel panel
+            matches the loaded data is applied.
+
+        Returns
+        -------
+        bool
+            ``True`` if a preset was applied, ``False`` if none matched.
+        """
+        if name is not None:
+            return self._config_manager.apply_named(name)
+        return self._config_manager.apply()
+
+    def list_configs(self) -> list[str]:
+        """Return the names of all saved viewer presets."""
+        return [cfg.get("name", path.stem) for path, cfg in self._config_manager.list_presets()]
 
     def run(self) -> None:
         """Run the napari application."""

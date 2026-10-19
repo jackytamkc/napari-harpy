@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Literal, TypeGuard
 
 import dask.array as da
@@ -29,6 +29,7 @@ from napari_harpy.viewer.labels_styling import (
     LabelsLoadResult,
     apply_table_color_source_to_labels_layer,
     build_styled_labels_layer_name,
+    masked_label_ids,
 )
 from napari_harpy.viewer.points_styling import (
     _POINTS_FACE_COLOR_OVERRIDE_ATTR,
@@ -46,6 +47,7 @@ from napari_harpy.viewer.shapes_styling import (
     apply_shape_column_color_source_to_shapes_layer,
     apply_table_color_source_to_shapes_layer,
     build_styled_shapes_layer_name,
+    source_row_hidden_mask,
 )
 from napari_harpy.viewer.shapes_styling import (
     apply_primary_shapes_layer_style as _apply_primary_shapes_layer_style,
@@ -603,6 +605,20 @@ class LayerBindingRegistry:
         self._bindings[id(binding.layer)] = binding
         return binding
 
+    def update_binding_style_spec(
+        self, layer: Layer, style_spec: TableColorSourceSpec | ShapeColumnColorSourceSpec
+    ) -> None:
+        """Replace the stored binding's ``style_spec`` in place (bindings are frozen).
+
+        Used when a display-only spec change (e.g. the continuous colormap, which does not
+        alter the layer name) reuses an existing styled layer: the layer is re-styled, and
+        its binding must carry the new spec so preset capture and later reuse matches see
+        the current value instead of the spec first registered.
+        """
+        binding = self._bindings.get(id(layer))
+        if binding is not None:
+            self._bindings[id(layer)] = replace(binding, style_spec=style_spec)
+
     def unregister_layer(self, layer: Layer) -> LayerBinding | None:
         """Remove a layer binding if present."""
         return self._bindings.pop(id(layer), None)
@@ -651,7 +667,10 @@ class LayerBindingRegistry:
             if style_spec is not None:
                 if not isinstance(binding, (LabelsLayerBinding, ShapesLayerBinding)):
                     continue
-                if binding.style_spec != style_spec:
+                # Match on layer identity, ignoring the display-only colormap -- consistent with
+                # `_matches_labels_binding`/`_matches_shapes_binding`, so a colormap change never
+                # hides a styled layer from this lookup either.
+                if not _style_specs_match_ignoring_display(binding.style_spec, style_spec):
                     continue
             if image_display_mode is not None:
                 if not isinstance(binding, ImageLayerBinding) or binding.image_display_mode != image_display_mode:
@@ -894,7 +913,7 @@ class ViewerAdapter(QObject):
         removed_binding = self.unregister_layer(layer)
         if removed_binding is None:
             logger.warning(
-                "Removed napari layer `%s` had no matching Harpy layer binding.", getattr(layer, "name", layer)
+                "Removed napari layer `{}` had no matching Harpy layer binding.", getattr(layer, "name", layer)
             )
         if had_primary_labels_semantics:
             self.primary_labels_layers_changed.emit()
@@ -1206,24 +1225,37 @@ class ViewerAdapter(QObject):
                 name=build_styled_labels_layer_name(labels_name, style_spec),
             )
             _add_layer_to_viewer(self._viewer, layer)
-            self.register_labels_layer(
-                layer,
-                sdata=sdata,
-                labels_name=labels_name,
-                coordinate_system=coordinate_system,
-                labels_role="styled",
-                style_spec=style_spec,
-            )
+            try:
+                self.register_labels_layer(
+                    layer,
+                    sdata=sdata,
+                    labels_name=labels_name,
+                    coordinate_system=coordinate_system,
+                    labels_role="styled",
+                    style_spec=style_spec,
+                )
+            except Exception:
+                self._remove_layer_from_viewer_and_registry(layer)
+                raise
         else:
             layer = existing_layer
 
+        try:
+            style_result = apply_table_color_source_to_labels_layer(
+                layer,
+                sdata=sdata,
+                labels_name=labels_name,
+                style_spec=style_spec,
+            )
+            self._apply_labels_hidden_ids(layer, sdata, labels_name, style_spec)
+        except Exception:
+            # Failed cross-sample presets (missing genes/UMAP/layers) must not
+            # leave an unstyled layer behind or replace a reused layer's spec.
+            if created:
+                self._remove_layer_from_viewer_and_registry(layer)
+            raise
+        self._layer_bindings.update_binding_style_spec(layer, style_spec)
         layer.name = build_styled_labels_layer_name(labels_name, style_spec)
-        style_result = apply_table_color_source_to_labels_layer(
-            layer,
-            sdata=sdata,
-            labels_name=labels_name,
-            style_spec=style_spec,
-        )
         return LabelsLoadResult(
             layer=layer,
             created=created,
@@ -1231,6 +1263,36 @@ class ViewerAdapter(QObject):
             palette_source=style_result.palette_source,
             coercion_applied=style_result.coercion_applied,
         )
+
+    def _apply_labels_hidden_ids(
+        self, layer: Labels, sdata: SpatialData, labels_name: str, style_spec: TableColorSourceSpec
+    ) -> None:
+        """Drop a styled labels layer's hidden + unassigned cells to background, under *any* blending.
+
+        napari's opaque blending ignores the ``DirectLabelColormap`` alpha, so alpha-0 'hidden'
+        categories reappear; unassigned (NaN-category) cells also render a flat grey. We map both sets'
+        label IDs to background (0) in the DISPLAYED raster (never the element/zarr) so hiding all types
+        gives a clean overlay. The original data is stashed on ``layer.metadata`` so a change re-masks
+        from source; an unchanged set is a no-op.
+        """
+        # Faithful change key: the actual masked label-ID set, which depends on BOTH the hidden/absent
+        # categories AND the obs cell->category assignments -- so reassigning a cell into an already-
+        # hidden class, or a change in which cells are unassigned, is caught. `masked_label_ids`
+        # short-circuits before the obs scan when nothing is hidden and the source isn't categorical.
+        masked_ids = masked_label_ids(sdata, labels_name, style_spec)
+        signature = frozenset(masked_ids)
+        if layer.metadata.get(_STYLED_LABELS_HIDDEN_SIGNATURE_KEY) == signature:
+            return
+        source = layer.metadata.get(_STYLED_LABELS_SOURCE_DATA_KEY)
+        if source is None:
+            source = layer.data
+            layer.metadata[_STYLED_LABELS_SOURCE_DATA_KEY] = source
+        new_data = (
+            _remap_labels_to_background(source, masked_ids, multiscale=layer.multiscale) if masked_ids else source
+        )
+        if new_data is not layer.data:
+            layer.data = new_data
+        layer.metadata[_STYLED_LABELS_HIDDEN_SIGNATURE_KEY] = signature
 
     def ensure_image_loaded(
         self,
@@ -1477,13 +1539,49 @@ class ViewerAdapter(QObject):
         *,
         fill: bool = False,
     ) -> ShapesLoadResult:
-        """Load or update one styled shapes layer variant."""
+        """Load or update one styled shapes layer variant.
+
+        Categories hidden via the per-category colour editor and categorically unassigned rows are
+        masked in a way that survives napari's ``opaque`` blending, which ignores alpha. Polygon
+        (``Shapes``) layers exclude their geometry entirely, rebuilding when the masked row set
+        changes; point-radius (``Points``) layers keep their full geometry and hide via napari's
+        per-point ``shown`` mask.
+        """
+        # Only a categorically rendered obs table source has hidden/unassigned rows to mask.
+        source_row_mask = (
+            source_row_hidden_mask(sdata, shapes_name, style_spec)
+            if isinstance(style_spec, TableColorSourceSpec)
+            else None
+        )
+        masked_signature = (
+            frozenset(int(i) for i in np.flatnonzero(source_row_mask)) if source_row_mask is not None else frozenset()
+        )
+        included_source_rows = (
+            frozenset(int(i) for i in np.flatnonzero(~source_row_mask)) if source_row_mask is not None else None
+        )
+
         existing_layer = self.get_loaded_styled_shapes_layer(
             sdata,
             shapes_name,
             style_spec,
             coordinate_system,
         )
+        # A polygon layer bakes the visible set into its geometry, so it must be rebuilt when the
+        # masked set changes. A point-radius Points layer keeps full geometry (re-masked via `shown`),
+        # so it is always reusable.
+        preserved_view_state: dict[str, Any] | None = None
+        if (
+            existing_layer is not None
+            and isinstance(existing_layer, Shapes)
+            and existing_layer.metadata.get(_STYLED_SHAPES_HIDDEN_SIGNATURE_KEY) != masked_signature
+        ):
+            # A rebuild replaces the layer object, so carry the user's view state across it -- else
+            # hiding a second category would reset, e.g., a deliberately `opaque` styled layer back to
+            # `translucent`, or make an intentionally hidden layer reappear.
+            preserved_view_state = _capture_styled_shapes_view_state(self._viewer, existing_layer)
+            self._remove_layer_from_viewer_and_registry(existing_layer)
+            existing_layer = None
+
         created = existing_layer is None
         if existing_layer is None:
             built_layer = _build_shapes_layer(
@@ -1492,6 +1590,7 @@ class ViewerAdapter(QObject):
                 coordinate_system,
                 name=build_styled_shapes_layer_name(shapes_name, style_spec),
                 sync_edge_color=False,
+                included_source_rows=included_source_rows,
             )
             layer = built_layer.layer
             _add_layer_to_viewer(self._viewer, layer)
@@ -1520,32 +1619,53 @@ class ViewerAdapter(QObject):
             if not isinstance(binding, ShapesLayerBinding):
                 raise ValueError("Styled shapes layer is missing its Harpy shapes binding.")
 
-        layer.name = build_styled_shapes_layer_name(shapes_name, style_spec)
-        if isinstance(style_spec, ShapeColumnColorSourceSpec):
-            shapes = getattr(sdata, "shapes", {})
-            if shapes_name not in shapes:
-                raise ValueError(f"Shapes element `{shapes_name}` is not available in the selected SpatialData object.")
+        try:
+            if isinstance(style_spec, ShapeColumnColorSourceSpec):
+                shapes = getattr(sdata, "shapes", {})
+                if shapes_name not in shapes:
+                    raise ValueError(
+                        f"Shapes element `{shapes_name}` is not available in the selected SpatialData object."
+                    )
 
-            style_result = apply_shape_column_color_source_to_shapes_layer(
-                layer,
-                shapes_element=shapes[shapes_name],
-                style_spec=style_spec,
-                source_row_id_by_rendered_row=binding.source_row_id_by_rendered_row,
-                source_shapes_index_feature_name=binding.source_shapes_index_feature_name,
-                fill=fill,
-            )
-        elif isinstance(style_spec, TableColorSourceSpec):
-            style_result = apply_table_color_source_to_shapes_layer(
-                layer,
-                sdata=sdata,
-                shapes_name=shapes_name,
-                style_spec=style_spec,
-                source_row_id_by_rendered_row=binding.source_row_id_by_rendered_row,
-                source_shapes_index_feature_name=binding.source_shapes_index_feature_name,
-                fill=fill,
-            )
-        else:
-            raise ValueError(f"Unsupported styled shapes color source spec: {style_spec!r}.")
+                style_result = apply_shape_column_color_source_to_shapes_layer(
+                    layer,
+                    shapes_element=shapes[shapes_name],
+                    style_spec=style_spec,
+                    source_row_id_by_rendered_row=binding.source_row_id_by_rendered_row,
+                    source_shapes_index_feature_name=binding.source_shapes_index_feature_name,
+                    fill=fill,
+                )
+            elif isinstance(style_spec, TableColorSourceSpec):
+                style_result = apply_table_color_source_to_shapes_layer(
+                    layer,
+                    sdata=sdata,
+                    shapes_name=shapes_name,
+                    style_spec=style_spec,
+                    source_row_id_by_rendered_row=binding.source_row_id_by_rendered_row,
+                    source_shapes_index_feature_name=binding.source_shapes_index_feature_name,
+                    fill=fill,
+                )
+            else:
+                raise ValueError(f"Unsupported styled shapes color source spec: {style_spec!r}.")
+
+            # Apply categorical masking. Polygon geometry was already filtered at build; record the
+            # signature so the next re-style knows whether to rebuild. Point-radius keeps full geometry
+            # and masks per-point via `shown`, which napari honours independent of blending.
+            if isinstance(layer, Points):
+                _apply_point_radius_hidden_visibility(layer, binding.source_row_id_by_rendered_row, source_row_mask)
+            else:
+                layer.metadata[_STYLED_SHAPES_HIDDEN_SIGNATURE_KEY] = masked_signature
+                # A rebuild only ever preserves state for a polygon Shapes layer: the point-radius vs
+                # polygon choice is made on the full unfiltered element, so it is stable across rebuilds
+                # (a captured state therefore always reaches this branch, never the Points one above).
+                _restore_styled_shapes_view_state(self._viewer, layer, preserved_view_state)
+        except Exception:
+            if created:
+                self._remove_layer_from_viewer_and_registry(layer)
+            raise
+        self._layer_bindings.update_binding_style_spec(layer, style_spec)
+        layer.name = build_styled_shapes_layer_name(shapes_name, style_spec)
+
         return ShapesLoadResult(
             layer=layer,
             created=created,
@@ -1970,6 +2090,103 @@ def _flatten_multiscale_element(element: DataTree) -> list[DataArray]:
     return multiscale_data
 
 
+# Records, on a styled polygon Shapes layer, the hidden/unassigned source-row positions its geometry
+# was built for, so a re-style can tell whether the masked set changed and geometry must be rebuilt.
+_STYLED_SHAPES_HIDDEN_SIGNATURE_KEY = "_harpy_styled_hidden_signature"
+
+# On a styled Labels layer: the hidden label-ID set the displayed raster is masked for, and a stash of
+# the ORIGINAL (unmasked) layer data so a hidden-set change can re-mask from source without touching disk.
+_STYLED_LABELS_HIDDEN_SIGNATURE_KEY = "_harpy_styled_labels_hidden_signature"
+_STYLED_LABELS_SOURCE_DATA_KEY = "_harpy_styled_labels_source_data"
+
+
+def _remap_labels_to_background(data: Any, hidden_ids: frozenset[int], *, multiscale: bool) -> Any:
+    """Return a copy of label data with ``hidden_ids`` mapped to 0 (background), staying lazy.
+
+    Each level's underlying array is unwrapped (an xarray ``DataArray`` -> its dask/numpy ``.data``),
+    masked with a per-block ``np.isin`` -- a lazy ``da.map_blocks`` when dask-backed, so the full raster
+    is never materialised -- then rewrapped to preserve dims/coords. Display-only: the source is never
+    mutated and the on-disk element/zarr is never written. ``multiscale`` masks each pyramid level (the
+    napari data is a ``MultiScaleData``, iterated here); napari re-wraps the returned list of levels.
+    """
+    hidden_sorted = np.asarray(sorted(hidden_ids), dtype="int64")
+
+    def _mask_block(block: np.ndarray) -> np.ndarray:
+        out = np.array(block, copy=True)
+        out[np.isin(block, hidden_sorted)] = 0
+        return out
+
+    def _mask_level(level: Any) -> Any:
+        is_dataarray = hasattr(level, "dims") and hasattr(level, "coords")  # xarray DataArray
+        underlying = level.data if is_dataarray else level
+        if isinstance(underlying, da.Array):
+            masked = da.map_blocks(_mask_block, underlying, dtype=underlying.dtype)  # lazy, per-block
+        else:
+            masked = _mask_block(np.asarray(underlying))
+        return level.copy(data=masked) if is_dataarray else masked
+
+    if multiscale:
+        return [_mask_level(level) for level in data]
+    return _mask_level(data)
+
+
+def _capture_styled_shapes_view_state(viewer: Any, layer: Shapes) -> dict[str, Any]:
+    """Capture the user-facing view state of a styled shapes layer before a geometry rebuild."""
+    try:
+        index = list(viewer.layers).index(layer)
+    except (ValueError, AttributeError):  # pragma: no cover - defensive
+        index = None
+    return {
+        "visible": bool(layer.visible),
+        "opacity": float(layer.opacity),
+        "blending": layer.blending,
+        "index": index,
+    }
+
+
+def _restore_styled_shapes_view_state(viewer: Any, layer: Shapes, state: dict[str, Any] | None) -> None:
+    """Re-apply a captured view state to the rebuilt styled shapes layer (visibility, opacity, z-order)."""
+    if state is None:
+        return
+    layer.visible = state["visible"]
+    layer.opacity = state["opacity"]
+    try:
+        layer.blending = state["blending"]
+    except (ValueError, TypeError):  # pragma: no cover - defensive across napari versions
+        pass
+    target_index = state["index"]
+    if target_index is None:
+        return
+    try:
+        current_index = list(viewer.layers).index(layer)
+    except (ValueError, AttributeError):  # pragma: no cover - defensive
+        return
+    if current_index != target_index and 0 <= target_index < len(viewer.layers):
+        viewer.layers.move(current_index, target_index)
+
+
+def _apply_point_radius_hidden_visibility(
+    layer: Points,
+    source_row_id_by_rendered_row: SourceRowIdByRenderedRow,
+    source_row_mask: np.ndarray | None,
+) -> None:
+    """Hide masked point-radius styled shapes via napari's ``shown`` mask.
+
+    ``shown`` is honoured independent of blending, so hidden categories and categorically unassigned
+    rows stay absent under ``opaque`` blending where alpha does not. The layer keeps its full
+    geometry; when nothing is masked every point is shown.
+    """
+    rendered_count = len(layer.data)
+    if source_row_mask is None:
+        layer.shown = np.ones(rendered_count, dtype=bool)
+        return
+    mapping = np.asarray(tuple(source_row_id_by_rendered_row), dtype=int)
+    if mapping.shape[0] != rendered_count:  # defensive: shown must have one entry per rendered point
+        layer.shown = np.ones(rendered_count, dtype=bool)
+        return
+    layer.shown = ~source_row_mask[mapping]
+
+
 def _build_shapes_layer(
     sdata: SpatialData,
     shapes_name: str,
@@ -1977,6 +2194,7 @@ def _build_shapes_layer(
     *,
     name: str,
     sync_edge_color: bool = True,
+    included_source_rows: frozenset[int] | None = None,
 ) -> _BuiltShapesLayer:
     shapes = getattr(sdata, "shapes", {})
     if shapes_name not in shapes:
@@ -2023,14 +2241,19 @@ def _build_shapes_layer(
             skipped_geometry_count=point_radius_inputs.skipped_geometry_count,
         )
 
-    napari_layer_inputs = _prepare_napari_shapes_layer_inputs(transformed_shapes)
-    if not napari_layer_inputs.data:
+    napari_layer_inputs = _prepare_napari_shapes_layer_inputs(
+        transformed_shapes, included_source_rows=included_source_rows
+    )
+    if not napari_layer_inputs.data and included_source_rows is None:
+        # An unfiltered element with no renderable geometry is an error. A filtered one that came out
+        # empty is legitimate: the user hid every category, so the styled layer is intentionally empty.
         raise ValueError(
             f"Shapes element `{shapes_name}` has no renderable geometries in coordinate system `{coordinate_system}`."
         )
 
     layer = _HarpyShapes(
         napari_layer_inputs.data,
+        ndim=2,  # harpy shapes are 2D; explicit for parity and for the empty (all-hidden) case
         name=name,
         shape_type=napari_layer_inputs.shape_types,
         features=napari_layer_inputs.features,
@@ -2064,7 +2287,20 @@ def _build_empty_primary_shapes_layer(
     return layer
 
 
-def _prepare_napari_shapes_layer_inputs(shapes_element: Any) -> _NapariShapesLayerInputs:
+def _prepare_napari_shapes_layer_inputs(
+    shapes_element: Any,
+    *,
+    included_source_rows: frozenset[int] | None = None,
+) -> _NapariShapesLayerInputs:
+    """Build napari Shapes inputs from a shapes element.
+
+    ``included_source_rows`` optionally restricts the layer to a subset of positional source
+    GeoDataFrame rows (used to exclude hidden categories and categorically unassigned rows so masking
+    survives napari's ``opaque`` blending, which ignores alpha). Excluded rows are omitted from
+    ``data``, ``features`` and ``source_row_id_by_rendered_row`` together -- keeping the three in
+    lockstep -- and are *not* counted in ``skipped_geometry_count`` (they are intentionally absent,
+    not unrenderable).
+    """
     data: list[np.ndarray] = []
     shape_types: list[ShapesLayerShapeType] = []
     feature_rows: list[dict[str, Any]] = []
@@ -2080,6 +2316,8 @@ def _prepare_napari_shapes_layer_inputs(shapes_element: Any) -> _NapariShapesLay
     for source_row_id, (source_index, geometry) in enumerate(
         zip(source_index_values, geometry_values, strict=True),
     ):
+        if included_source_rows is not None and source_row_id not in included_source_rows:
+            continue  # masked category/missing value: omit geometry (not a skipped/unrenderable row)
         row_shape_count = len(data)
         feature_row = {index_feature_name: source_index}
 
@@ -2320,6 +2558,25 @@ def _matches_binding(
     )
 
 
+def _style_specs_match_ignoring_display(
+    a: TableColorSourceSpec | ShapeColumnColorSourceSpec | None,
+    b: TableColorSourceSpec | ShapeColumnColorSourceSpec | None,
+) -> bool:
+    """True if two color-source specs are equal apart from display-only fields.
+
+    ``colormap`` changes the rendered continuous colors but NOT the layer name, so two
+    specs differing only by colormap denote the *same* styled layer and must reuse (and
+    re-style) it rather than fork a duplicate with a colliding name. ``layer``/``smoother``
+    are deliberately excluded here -- they ARE encoded in the layer name, so they stay
+    significant and legitimately produce distinct, coexisting styled variants.
+    """
+    if a is None or b is None:
+        return a is b
+    if type(a) is not type(b):
+        return False
+    return replace(a, colormap=None) == replace(b, colormap=None)
+
+
 def _matches_labels_binding(
     binding: LayerBinding | None,
     *,
@@ -2337,7 +2594,7 @@ def _matches_labels_binding(
         return False
     if labels_role is not None and binding.labels_role != labels_role:
         return False
-    if style_spec is not None and binding.style_spec != style_spec:
+    if style_spec is not None and not _style_specs_match_ignoring_display(binding.style_spec, style_spec):
         return False
     return True
 
@@ -2359,7 +2616,7 @@ def _matches_shapes_binding(
         return False
     if shapes_role is not None and binding.shapes_role != shapes_role:
         return False
-    if style_spec is not None and binding.style_spec != style_spec:
+    if style_spec is not None and not _style_specs_match_ignoring_display(binding.style_spec, style_spec):
         return False
     return True
 

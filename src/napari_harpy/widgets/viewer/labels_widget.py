@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from qtpy.QtCore import QSignalBlocker, QStringListModel, Qt, Signal
 from qtpy.QtWidgets import (
+    QCheckBox,
     QCompleter,
     QFormLayout,
     QFrame,
@@ -11,18 +12,28 @@ from qtpy.QtWidgets import (
     QLineEdit,
     QPushButton,
     QSizePolicy,
+    QStackedWidget,
     QVBoxLayout,
 )
 
-from napari_harpy.core._color_source import TableColorSourceKind, TableColorSourceSpec
+from napari_harpy.core._color_source import (
+    TableColorSourceKind,
+    TableColorSourceSpec,
+    gene_module_value_key,
+    parse_gene_module_text,
+    validate_gene_module_genes,
+)
+from napari_harpy.viewer._styling import CONTINUOUS_COLORMAP_CHOICES, OVERLAY_CONTINUOUS_COLORMAP
 from napari_harpy.widgets.shared_styles import (
     ACTION_BUTTON_STYLESHEET,
+    CHECKBOX_STYLESHEET,
     COMPLETER_POPUP_STYLESHEET,
     CompactComboBox,
     build_input_control_stylesheet,
     create_form_label,
 )
 from napari_harpy.widgets.viewer.disclosure import _ElidedLabel
+from napari_harpy.widgets.viewer.module_smoothing import ModuleSmoothingControl
 from napari_harpy.widgets.viewer.styles import (
     CARD_TITLE_STYLESHEET,
     DETAIL_PANEL_STYLESHEET,
@@ -43,17 +54,26 @@ class _LabelsCardWidget(QFrame):
     """Card UI for one labels element in the selected coordinate system."""
 
     add_update_requested = Signal(object)
+    edit_colors_requested = Signal(object)
 
     def __init__(
         self,
         *,
         labels_name: str,
         table_color_sources_by_table: dict[str, list[TableColorSourceSpec]],
+        table_layers_by_table: dict[str, list[str]] | None = None,
+        table_smoothers_by_table: dict[str, list[str]] | None = None,
+        table_umap_by_table: dict[str, bool] | None = None,
     ) -> None:
         super().__init__()
         self.labels_name = labels_name
         self._table_color_sources_by_table = table_color_sources_by_table
+        self._table_layers_by_table = table_layers_by_table or {}
+        self._table_smoothers_by_table = table_smoothers_by_table or {}
+        self._table_umap_by_table = table_umap_by_table or {}
+        self._expression_layer_by_table: dict[str, str] = {}
         self._filtered_color_sources: list[TableColorSourceSpec] = []
+        self._module_gene_text = ""
         self.setObjectName(f"viewer_widget_labels_card_{labels_name}")
         self.setProperty("harpyViewerDetailPanel", True)
         self.setStyleSheet(DETAIL_PANEL_STYLESHEET)
@@ -90,6 +110,7 @@ class _LabelsCardWidget(QFrame):
         self.color_source_kind_combo.addItem("None", None)
         self.color_source_kind_combo.addItem("Observations", "obs_column")
         self.color_source_kind_combo.addItem("Vars", "x_var")
+        self.color_source_kind_combo.addItem("Gene module", "x_module")
 
         self.color_source_value_label = create_form_label("Value source")
         self.color_source_value_input = QLineEdit()
@@ -106,6 +127,44 @@ class _LabelsCardWidget(QFrame):
         self._color_source_completer.popup().setStyleSheet(COMPLETER_POPUP_STYLESHEET)
         self.color_source_value_input.setCompleter(self._color_source_completer)
 
+        # Observation columns are few and researcher-named -> a scrollable dropdown (like the other combos).
+        # Vars (the large gene list) keep the type-to-filter line edit. A stack swaps them.
+        self.color_source_value_combo = CompactComboBox(minimum_contents_length=8)
+        self.color_source_value_combo.setObjectName(f"viewer_widget_color_source_value_combo_{labels_name}")
+        self.color_source_value_combo.setStyleSheet(INPUT_CONTROL_STYLESHEET)
+        self.color_source_value_combo.setEnabled(False)
+        self.color_source_value_stack = QStackedWidget()
+        self.color_source_value_stack.addWidget(self.color_source_value_combo)  # index 0: observation columns
+        self.color_source_value_stack.addWidget(self.color_source_value_input)  # index 1: vars (type-to-filter)
+        self.color_source_value_stack.setCurrentWidget(self.color_source_value_input)
+
+        self.layer_label = create_form_label("Layer")
+        self.layer_combo = CompactComboBox(minimum_contents_length=8)
+        self.layer_combo.setObjectName(f"viewer_widget_labels_layer_combo_{labels_name}")
+        self.layer_combo.setStyleSheet(INPUT_CONTROL_STYLESHEET)
+        self.layer_combo.setToolTip(
+            "Expression layer to read gene values from (X, or a table layer like log1p/smoothed)"
+        )
+
+        self.smooth_label = create_form_label("Smoothing")
+        self.smooth_checkbox = QCheckBox("Smooth over UMAP neighbours")
+        self.smooth_checkbox.setObjectName(f"viewer_widget_labels_smooth_checkbox_{labels_name}")
+        self.smooth_checkbox.setStyleSheet(CHECKBOX_STYLESHEET)
+        self.smooth_checkbox.setToolTip(
+            "Average each gene over every cell's UMAP neighbourhood on the fly (obsp smoother)"
+        )
+
+        self.module_smoothing_label = create_form_label("Smoothing")
+        self.module_smoothing = ModuleSmoothingControl()
+        self.module_smoothing.setObjectName(f"viewer_widget_labels_module_smoothing_{labels_name}")
+
+        self.colormap_label = create_form_label("Colourmap")
+        self.colormap_combo = CompactComboBox(minimum_contents_length=8)
+        self.colormap_combo.setObjectName(f"viewer_widget_labels_colormap_combo_{labels_name}")
+        self.colormap_combo.setStyleSheet(INPUT_CONTROL_STYLESHEET)
+        self.colormap_combo.addItems(list(CONTINUOUS_COLORMAP_CHOICES))
+        self.colormap_combo.setToolTip("Matplotlib colourmap for continuous (gene, module, or numeric) colouring")
+
         self.action_hint_label = QLabel()
         self.action_hint_label.setObjectName(f"viewer_widget_action_hint_{labels_name}")
         self.action_hint_label.setWordWrap(True)
@@ -118,18 +177,38 @@ class _LabelsCardWidget(QFrame):
         self.add_update_button.setStyleSheet(ACTION_BUTTON_STYLESHEET)
         self.add_update_button.clicked.connect(self._emit_add_update_request)
 
+        self.edit_colors_button = QPushButton("Edit colours…")
+        self.edit_colors_button.setObjectName(f"viewer_widget_edit_labels_colors_button_{labels_name}")
+        self.edit_colors_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.edit_colors_button.setMinimumHeight(28)
+        self.edit_colors_button.setStyleSheet(ACTION_BUTTON_STYLESHEET)
+        self.edit_colors_button.setEnabled(False)
+        self.edit_colors_button.setToolTip("Pick a colour per category for the selected observation column")
+        self.edit_colors_button.clicked.connect(self._emit_edit_colors_request)
+
+        self._form_layout = form_layout
         form_layout.addRow(linked_table_label, self.linked_table_combo)
         form_layout.addRow(color_source_kind_label, self.color_source_kind_combo)
-        form_layout.addRow(self.color_source_value_label, self.color_source_value_input)
+        form_layout.addRow(self.color_source_value_label, self.color_source_value_stack)
+        form_layout.addRow(self.layer_label, self.layer_combo)
+        form_layout.addRow(self.smooth_label, self.smooth_checkbox)
+        form_layout.addRow(self.module_smoothing_label, self.module_smoothing)
+        form_layout.addRow(self.colormap_label, self.colormap_combo)
 
         layout.addLayout(form_layout)
         layout.addWidget(self.action_hint_label)
         layout.addWidget(self.add_update_button)
+        layout.addWidget(self.edit_colors_button)
 
         self.linked_table_combo.currentIndexChanged.connect(self._refresh_color_source_controls)
         self.color_source_kind_combo.currentIndexChanged.connect(self._refresh_color_source_controls)
-        self.color_source_value_input.textChanged.connect(self._update_action_status)
+        self.color_source_value_input.textChanged.connect(self._on_color_source_text_changed)
         self.color_source_value_input.editingFinished.connect(self._sync_current_source_selection)
+        self.color_source_value_combo.currentIndexChanged.connect(self._update_action_status)
+        self.layer_combo.currentIndexChanged.connect(self._on_expression_layer_changed)
+        self.smooth_checkbox.toggled.connect(self._update_action_status)
+        self.module_smoothing.changed.connect(self._update_action_status)
+        self.colormap_combo.currentIndexChanged.connect(self._update_action_status)
 
         self._refresh_color_source_controls()
 
@@ -144,20 +223,104 @@ class _LabelsCardWidget(QFrame):
     @property
     def selected_source_kind(self) -> TableColorSourceKind | None:
         value = self.color_source_kind_combo.currentData()
-        return value if value in {"obs_column", "x_var"} else None
+        return value if value in {"obs_column", "x_var", "x_module"} else None
 
     @property
     def selected_color_source(self) -> TableColorSourceSpec | None:
-        current_text = self.color_source_value_input.text().strip()
+        if self.selected_source_kind == "x_module":
+            genes, _error = self._validated_module_genes()
+            if genes is None or self.selected_table_name is None or self._module_smoothing_error() is not None:
+                return None
+            return TableColorSourceSpec(
+                table_name=self.selected_table_name,
+                source_kind="x_module",
+                value_key=gene_module_value_key(genes),
+                value_kind="continuous",
+                layer=self._selected_layer(),
+                colormap=self._selected_colormap(),
+                module_genes=genes,
+                umap_neighbors=self.module_smoothing.n_neighbors,
+            )
+
+        current_text = self._current_value_text()
         for source in self._filtered_color_sources:
             if source.display_name == current_text:
+                if source.source_kind == "x_var":
+                    source = replace(source, layer=self._selected_layer(), smoother=self._selected_smoother())
+                if source.value_kind == "continuous":
+                    source = replace(source, colormap=self._selected_colormap())
                 return source
         return None
+
+    def _validated_module_genes(self) -> tuple[tuple[str, ...] | None, str | None]:
+        genes = parse_gene_module_text(self.color_source_value_input.text())
+        table_name = self.selected_table_name
+        available_var_names = (
+            tuple(
+                source.value_key
+                for source in self._table_color_sources_by_table.get(table_name, ())
+                if source.source_kind == "x_var"
+            )
+            if table_name is not None
+            else ()
+        )
+        try:
+            return validate_gene_module_genes(genes, available_var_names=available_var_names), None
+        except ValueError as error:
+            return None, str(error)
+
+    def _module_smoothing_error(self) -> str | None:
+        if self.module_smoothing.n_neighbors is not None and not self._table_umap_by_table.get(
+            self.selected_table_name, False
+        ):
+            return (
+                "UMAP smoothing requires X_umap in the linked table. "
+                "For an already smoothed layer, disable UMAP smoothing."
+            )
+        return None
+
+    def _on_expression_layer_changed(self, _index: int) -> None:
+        table_name = self.selected_table_name
+        layer = self.layer_combo.currentText()
+        if table_name is not None and layer:
+            self._expression_layer_by_table[table_name] = layer
+        self._update_action_status()
+
+    def _current_value_text(self) -> str:
+        """Return the selected value from whichever widget is shown (combo for obs columns, line edit for vars)."""
+        if self.color_source_value_stack.currentWidget() is self.color_source_value_combo:
+            return self.color_source_value_combo.currentText().strip()
+        return self.color_source_value_input.text().strip()
+
+    def _selected_layer(self) -> str | None:
+        text = self.layer_combo.currentText().strip()
+        return None if text in ("", "X") else text
+
+    def _selected_smoother(self) -> str | None:
+        if not self.smooth_checkbox.isChecked():
+            return None
+        smoothers = self._table_smoothers_by_table.get(self.selected_table_name) or []
+        return smoothers[0] if smoothers else None
+
+    def _selected_colormap(self) -> str | None:
+        # None for the viridis default (like _selected_layer returns None for "X"), so unchanged
+        # selections keep specs/presets minimal; the styling layer resolves None -> viridis.
+        text = self.colormap_combo.currentText().strip()
+        return None if text in ("", OVERLAY_CONTINUOUS_COLORMAP) else text
 
     def set_linked_tables(
         self,
         table_color_sources_by_table: dict[str, list[TableColorSourceSpec]],
+        table_layers_by_table: dict[str, list[str]] | None = None,
+        table_smoothers_by_table: dict[str, list[str]] | None = None,
+        table_umap_by_table: dict[str, bool] | None = None,
     ) -> None:
+        if table_layers_by_table is not None:
+            self._table_layers_by_table = table_layers_by_table
+        if table_smoothers_by_table is not None:
+            self._table_smoothers_by_table = table_smoothers_by_table
+        if table_umap_by_table is not None:
+            self._table_umap_by_table = table_umap_by_table
         previous_table_name = self.selected_table_name
         previous_source_kind = self.selected_source_kind
         previous_source_identity = (
@@ -207,6 +370,9 @@ class _LabelsCardWidget(QFrame):
         elif source_kind == "x_var":
             self.color_source_value_label.setText("Var")
             placeholder_text = "Search vars"
+        elif source_kind == "x_module":
+            self.color_source_value_label.setText("Genes")
+            placeholder_text = "Comma-separated genes (at least two)"
         else:
             self.color_source_value_label.setText("Value source")
             placeholder_text = "Select a color source kind first"
@@ -214,47 +380,90 @@ class _LabelsCardWidget(QFrame):
         available_sources = (
             list(self._table_color_sources_by_table.get(table_name, ())) if table_name is not None else []
         )
+        filtered_kind = "x_var" if source_kind == "x_module" else source_kind
         self._filtered_color_sources = [
-            source for source in available_sources if source_kind is None or source.source_kind == source_kind
+            source for source in available_sources if filtered_kind is None or source.source_kind == filtered_kind
         ]
 
-        with QSignalBlocker(self.color_source_value_input):
-            if source_kind is None:
-                self.color_source_value_input.setEnabled(False)
-                self.color_source_value_input.clear()
-                self.color_source_value_input.setPlaceholderText(placeholder_text)
-            else:
-                self.color_source_value_input.setEnabled(bool(self._filtered_color_sources))
-                if selected_source_identity is not None:
-                    matching_source = next(
-                        (
-                            source
-                            for source in self._filtered_color_sources
-                            if source.identity == selected_source_identity
-                        ),
-                        None,
-                    )
-                    if matching_source is not None:
-                        self.color_source_value_input.setText(matching_source.display_name)
-                    elif self._filtered_color_sources:
-                        self.color_source_value_input.setText(self._filtered_color_sources[0].display_name)
-                    else:
-                        self.color_source_value_input.clear()
-                elif self._filtered_color_sources:
-                    self.color_source_value_input.setText(self._filtered_color_sources[0].display_name)
-                else:
-                    self.color_source_value_input.clear()
+        display_names = [source.display_name for source in self._filtered_color_sources]
+        target_name = None
+        if selected_source_identity is not None:
+            match = next((s for s in self._filtered_color_sources if s.identity == selected_source_identity), None)
+            if match is not None:
+                target_name = match.display_name
+        if target_name is None and display_names and source_kind != "x_module":
+            target_name = display_names[0]
 
+        if source_kind == "obs_column":
+            # Observation columns are few and researcher-named -> a scrollable dropdown.
+            with QSignalBlocker(self.color_source_value_combo):
+                self.color_source_value_combo.clear()
+                self.color_source_value_combo.addItems(display_names)
+                self.color_source_value_combo.setEnabled(bool(display_names))
+                if target_name is not None:
+                    self.color_source_value_combo.setCurrentText(target_name)
+            self.color_source_value_stack.setCurrentWidget(self.color_source_value_combo)
+        else:
+            # Vars (large gene list) -> keep the type-to-filter line edit; None -> disabled line edit.
+            with QSignalBlocker(self.color_source_value_input):
+                self.color_source_value_input.setEnabled(source_kind is not None and bool(display_names))
+                self.color_source_value_input.setText(
+                    self._module_gene_text if source_kind == "x_module" else target_name or ""
+                )
                 self.color_source_value_input.setPlaceholderText(placeholder_text)
+                # A normal QCompleter replaces the entire line, which is destructive for a
+                # comma-separated module after its first gene. Keep it for single-var search only.
+                self._color_source_completer_model.setStringList([] if source_kind == "x_module" else display_names)
+            self.color_source_value_stack.setCurrentWidget(self.color_source_value_input)
 
-            self._color_source_completer_model.setStringList(
-                [source.display_name for source in self._filtered_color_sources]
-            )
+        is_expression_source = source_kind in {"x_var", "x_module"}
+        with QSignalBlocker(self.layer_combo):
+            self.layer_combo.clear()
+            if is_expression_source:
+                self.layer_combo.addItems(self._table_layers_by_table.get(self.selected_table_name) or ["X"])
+                previous_layer = self._expression_layer_by_table.get(self.selected_table_name, "X")
+                previous_index = self.layer_combo.findText(previous_layer)
+                self.layer_combo.setCurrentIndex(max(0, previous_index))
+        self._set_layer_row_visible(is_expression_source)
+
+        smoothers = self._table_smoothers_by_table.get(self.selected_table_name) or []
+        if smoothers:
+            self.smooth_checkbox.setText(f"Smooth over UMAP neighbours ({smoothers[0]})")
+        self._set_smooth_row_visible(source_kind == "x_var" and bool(smoothers))
+        if hasattr(self._form_layout, "setRowVisible"):
+            self._form_layout.setRowVisible(self.module_smoothing, source_kind == "x_module")
+        else:  # pragma: no cover - older Qt
+            self.module_smoothing_label.setVisible(source_kind == "x_module")
+            self.module_smoothing.setVisible(source_kind == "x_module")
 
         self._update_action_status()
 
+    def _set_layer_row_visible(self, visible: bool) -> None:
+        if hasattr(self._form_layout, "setRowVisible"):
+            self._form_layout.setRowVisible(self.layer_combo, visible)
+        else:  # pragma: no cover - older Qt without QFormLayout.setRowVisible
+            self.layer_label.setVisible(visible)
+            self.layer_combo.setVisible(visible)
+
+    def _set_smooth_row_visible(self, visible: bool) -> None:
+        if hasattr(self._form_layout, "setRowVisible"):
+            self._form_layout.setRowVisible(self.smooth_checkbox, visible)
+        else:  # pragma: no cover - older Qt without QFormLayout.setRowVisible
+            self.smooth_label.setVisible(visible)
+            self.smooth_checkbox.setVisible(visible)
+
+    def _set_colormap_row_visible(self, visible: bool) -> None:
+        if hasattr(self._form_layout, "setRowVisible"):
+            self._form_layout.setRowVisible(self.colormap_combo, visible)
+        else:  # pragma: no cover - older Qt without QFormLayout.setRowVisible
+            self.colormap_label.setVisible(visible)
+            self.colormap_combo.setVisible(visible)
+
     def _sync_current_source_selection(self) -> None:
         if not self.color_source_value_input.isEnabled():
+            return
+        if self.selected_source_kind == "x_module":
+            self._update_action_status()
             return
 
         current_text = self.color_source_value_input.text().strip()
@@ -264,10 +473,18 @@ class _LabelsCardWidget(QFrame):
                 break
         self._update_action_status()
 
+    def _on_color_source_text_changed(self, text: str) -> None:
+        if self.selected_source_kind == "x_module":
+            self._module_gene_text = text
+        self._update_action_status()
+
     def _update_action_status(self) -> None:
         source_kind = self.selected_source_kind
         table_name = self.selected_table_name
         selected_source = self.selected_color_source
+        self.edit_colors_button.setEnabled(selected_source is not None and selected_source.source_kind == "obs_column")
+        # The colourmap only affects continuous (gene / numeric) colouring; hide it for categorical.
+        self._set_colormap_row_visible(selected_source is not None and selected_source.value_kind == "continuous")
 
         if source_kind is None:
             self.action_hint_label.setText("Action: add/update primary labels layer")
@@ -287,6 +504,26 @@ class _LabelsCardWidget(QFrame):
             self.action_hint_label.setText(f'Action: add/update colored overlay for obs["{selected_source.value_key}"]')
             return
 
+        if source_kind == "x_module":
+            if not self._filtered_color_sources:
+                self.action_hint_label.setText("Action: no vars available for a gene-module overlay")
+                return
+            genes, error = self._validated_module_genes()
+            if genes is None:
+                self.action_hint_label.setText(f"Action: {error}")
+                return
+            smoothing_error = self._module_smoothing_error()
+            if smoothing_error is not None:
+                self.action_hint_label.setText(f"Action: {smoothing_error}")
+                return
+            layer = self._selected_layer() or "X"
+            k = self.module_smoothing.n_neighbors
+            smoothed = f" with UMAP smoothing (k={k}, including self)" if k is not None else " (selected layer only)"
+            self.action_hint_label.setText(
+                f"Action: add/update module score (mean z-score of {len(genes)} genes) from {layer}{smoothed}"
+            )
+            return
+
         if selected_source is None:
             if self._filtered_color_sources:
                 self.action_hint_label.setText("Action: select a var for a colored overlay")
@@ -294,10 +531,24 @@ class _LabelsCardWidget(QFrame):
                 self.action_hint_label.setText("Action: no vars available for a colored overlay")
             return
 
-        self.action_hint_label.setText(f'Action: add/update colored overlay for X[:, "{selected_source.value_key}"]')
+        layer = self._selected_layer() or "X"
+        smoothed = " (smoothed)" if self._selected_smoother() else ""
+        self.action_hint_label.setText(
+            f'Action: add/update colored overlay for {layer}[:, "{selected_source.value_key}"]{smoothed}'
+        )
 
     def _emit_add_update_request(self, _checked: bool = False) -> None:
         self.add_update_requested.emit(
+            LabelsLoadRequest(
+                labels_name=self.labels_name,
+                table_name=self.selected_table_name,
+                selected_source_kind=self.selected_source_kind,
+                selected_color_source=self.selected_color_source,
+            )
+        )
+
+    def _emit_edit_colors_request(self, _checked: bool = False) -> None:
+        self.edit_colors_requested.emit(
             LabelsLoadRequest(
                 labels_name=self.labels_name,
                 table_name=self.selected_table_name,
